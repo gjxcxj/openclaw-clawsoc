@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ClawSoc runtime data (NEVER commit these)
+soc.md
+soc/
+logs/
+*.jsonl
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Misc
+*.log
