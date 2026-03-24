@@ -1,4 +1,13 @@
 #!/usr/bin/env python3
+"""ClawSoc CLI — simplified pairing model (v2).
+
+Pairing flow:
+  1. Both sides: init + serve
+  2. Either side: discover (optional) + pair <endpoint-or-peer-id>
+  3. Done. Both sides are L0 peers.
+
+No invite codes. No intermediate steps.
+"""
 from __future__ import annotations
 
 import argparse
@@ -17,8 +26,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from chat_history import load_history, render_history
-from pairing import build_invite, parse_invite
-from peer_server import serve
 from sharing import allowed_share_types, build_share_content, sanitize_share_content
 from soc_store import (
     LEVEL_NAMES,
@@ -61,6 +68,10 @@ SHARE_TYPE_ALIASES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
 def request_json(url: str, payload: dict) -> dict:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
@@ -102,6 +113,10 @@ def make_envelope(peer_id: str, msg_type: str, payload: dict) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# init / identity / serve
+# ---------------------------------------------------------------------------
+
 def cmd_init(args: argparse.Namespace) -> None:
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = init_state(paths, host=args.host, port=args.port, force=args.force)
@@ -116,13 +131,17 @@ def cmd_identity(args: argparse.Namespace) -> None:
     print(json.dumps(state["identity"], ensure_ascii=False, indent=2))
 
 
-def cmd_invite(args: argparse.Namespace) -> None:
+def cmd_serve(args: argparse.Namespace) -> None:
+    from peer_server import serve
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
-    state = load_state(paths)
-    if not state.get("identity"):
-        state = init_state(paths)
-    print(build_invite(state["identity"]["id"], state["identity"]["endpoint"], ttl_minutes=args.ttl))
+    state = init_state(paths, host=args.host, port=args.port)
+    app = {"paths": paths, "share_requirements": SHARE_MIN_LEVEL}
+    serve(app, args.host, args.port)
 
+
+# ---------------------------------------------------------------------------
+# discover
+# ---------------------------------------------------------------------------
 
 def _candidate_hosts(state: dict, args: argparse.Namespace) -> list[str]:
     explicit_hosts = [host.strip() for host in (args.hosts or "").split(",") if host.strip()]
@@ -131,22 +150,18 @@ def _candidate_hosts(state: dict, args: argparse.Namespace) -> list[str]:
     if args.cidr:
         network = ipaddress.ip_network(args.cidr, strict=False)
         return [str(host) for host in network.hosts()]
-
     endpoint = state.get("identity", {}).get("endpoint", "")
     host = "127.0.0.1"
     try:
         host = endpoint.split("://", 1)[1].rsplit(":", 1)[0]
     except IndexError:
         pass
-
     if host == "127.0.0.1":
         return ["127.0.0.1"]
-
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return [host]
-
     if ip.version != 4:
         return [host]
     network = ipaddress.ip_network(f"{host}/24", strict=False)
@@ -176,7 +191,6 @@ def _discover_peers(paths, state: dict, args: argparse.Namespace) -> dict[str, d
             "endpoint": endpoint,
             "host": host,
             "port": port,
-            "invite": build_invite(payload.get("peerId"), endpoint, ttl_minutes=10),
         }
 
     discovered: list[dict] = []
@@ -189,13 +203,10 @@ def _discover_peers(paths, state: dict, args: argparse.Namespace) -> dict[str, d
     for item in discovered:
         deduped[item["peerId"]] = item
 
-    cli_path = Path(__file__).resolve()
     for peer in deduped.values():
-        peer["pairCommand"] = f"python3 {cli_path} pair-direct {peer['peerId']}"
-        peer["pairWithInviteCommand"] = f'python3 {cli_path} pair "{peer["invite"]}"'
         existing = state.get("peers", {}).get(peer["peerId"], {})
-        peer["recordedStatus"] = existing.get("status", "unknown")
-        peer["recordedLevel"] = existing.get("relationshipLevel", "L0")
+        peer["status"] = existing.get("status", "discovered")
+        peer["level"] = existing.get("relationshipLevel", "L0")
     return deduped
 
 
@@ -230,17 +241,43 @@ def cmd_discover(args: argparse.Namespace) -> None:
     print(json.dumps({"ok": True, "count": len(deduped), "peers": list(deduped.values())}, ensure_ascii=False, indent=2))
 
 
-def cmd_pair(args: argparse.Namespace) -> None:
-    paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
-    state = load_state(paths)
-    if not state.get("identity"):
-        state = init_state(paths)
-    print(json.dumps(_pair_with_invite(paths, state, args.invite), ensure_ascii=False, indent=2))
+# ---------------------------------------------------------------------------
+# pair  (simplified: endpoint or peer_id, no invite codes)
+# ---------------------------------------------------------------------------
+
+def _resolve_endpoint(state: dict, target: str) -> str:
+    """Resolve target to an endpoint URL.
+
+    target can be:
+      - A full URL like http://192.168.1.10:45678
+      - A peer_id that was previously discovered/recorded
+      - An IP address (port defaults to 45678)
+      - host:port
+    """
+    if target.startswith("http://") or target.startswith("https://"):
+        return target.rstrip("/")
+    # Known peer_id
+    peer = state.get("peers", {}).get(target)
+    if peer and peer.get("endpoint"):
+        return peer["endpoint"].rstrip("/")
+    # host:port
+    if ":" in target:
+        return f"http://{target}"
+    # Bare IP or hostname
+    return f"http://{target}:45678"
 
 
-def _pair_with_invite(paths, state: dict, invite_token: str) -> None:
-    invite = parse_invite(invite_token)
-    healthcheck(f"{invite['endpoint']}/clawsoc/health")
+def _do_pair(paths, state: dict, endpoint: str) -> dict:
+    """Pair with a peer at the given endpoint. Returns the peer dict."""
+    health = healthcheck(f"{endpoint}/clawsoc/health")
+    if not health.get("ok"):
+        raise SystemExit(f"Peer at {endpoint} is not healthy: {health}")
+    remote_id = health.get("peerId")
+    if not remote_id:
+        raise SystemExit(f"Peer at {endpoint} returned no peerId")
+    if remote_id == state.get("identity", {}).get("id"):
+        raise SystemExit("Cannot pair with yourself")
+
     envelope = make_envelope(
         state["identity"]["id"],
         "pair.request",
@@ -251,49 +288,42 @@ def _pair_with_invite(paths, state: dict, invite_token: str) -> None:
             "endpoint": state["identity"]["endpoint"],
         },
     )
-    response = request_json(f"{invite['endpoint']}/clawsoc/pair", envelope)
-    remote = response["identity"]
-    existing = state.get("peers", {}).get(remote["peerId"], {})
+    response = request_json(f"{endpoint}/clawsoc/pair", envelope)
+    remote_identity = response.get("identity", {})
+    existing = state.get("peers", {}).get(remote_id, {})
     peer = upsert_peer(
         paths,
         state,
         {
-            "peerId": remote["peerId"],
-            "displayName": remote["displayName"],
-            "nickname": remote["displayName"],
-            "emoji": remote.get("emoji"),
-            "bio": remote.get("bio"),
-            "endpoint": remote["endpoint"],
+            "peerId": remote_identity.get("peerId") or remote_id,
+            "displayName": remote_identity.get("displayName") or health.get("displayName") or remote_id,
+            "nickname": remote_identity.get("displayName") or health.get("displayName") or remote_id,
+            "emoji": remote_identity.get("emoji") or health.get("emoji"),
+            "bio": remote_identity.get("bio") or health.get("bio"),
+            "endpoint": remote_identity.get("endpoint") or endpoint,
             "relationshipLevel": existing.get("relationshipLevel", "L0"),
             "status": "active",
             "lastSeenAt": utc_now(),
         },
     )
-    log_event(paths, "pair.requested", {"peerId": peer["peerId"], "requestId": envelope["requestId"]})
+    log_event(paths, "pair.completed", {"peerId": peer["peerId"], "endpoint": endpoint, "requestId": envelope["requestId"]})
     save_state(paths, state)
-    return {"ok": True, "peer": peer}
+    return peer
 
 
-def cmd_pair_direct(args: argparse.Namespace) -> None:
-    result = _pair_direct(
-        Path(args.workspace_root).resolve() if args.workspace_root else None,
-        args.peer_id,
-        ttl=args.ttl,
-    )
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-def _pair_direct(workspace_root: Path | None, peer_id: str, *, ttl: int) -> dict:
-    paths = get_paths(workspace_root)
+def cmd_pair(args: argparse.Namespace) -> None:
+    paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
-    peer = _get_peer_or_die(state, peer_id, require_known=True)
-    if peer.get("status") == "active":
-        return {"ok": True, "peer": peer, "message": "Peer already paired"}
-    invite = build_invite(peer["peerId"], peer["endpoint"], ttl_minutes=ttl)
-    return _pair_with_invite(paths, state, invite)
+    endpoint = _resolve_endpoint(state, args.target)
+    peer = _do_pair(paths, state, endpoint)
+    print(json.dumps({"ok": True, "peer": peer}, ensure_ascii=False, indent=2))
 
+
+# ---------------------------------------------------------------------------
+# discover-ui (interactive terminal)
+# ---------------------------------------------------------------------------
 
 def _copy_to_clipboard(text: str) -> bool:
     for program in ("pbcopy",):
@@ -333,16 +363,14 @@ def _recent_share_summaries(paths, peer_id: str, limit: int = 2) -> list[str]:
 
 
 def _available_quick_shares(level: str) -> list[str]:
-    available = []
-    for share_type, minimum in SHARE_MIN_LEVEL.items():
-        if level_at_least(level, minimum):
-            available.append(share_type)
-    return available
+    return [st for st, ml in SHARE_MIN_LEVEL.items() if level_at_least(level, ml)]
 
 
 def _render_chat_panel(paths, peer_id: str, limit: int = 12) -> str:
     state = load_state(paths)
-    peer = _get_peer_or_die(state, peer_id)
+    peer = state.get("peers", {}).get(peer_id)
+    if not peer:
+        return f"未知 peer: {peer_id}"
     history_path = paths.peers_dir / peer["peerId"] / "messages.jsonl"
     history = render_history(load_history(history_path), limit=limit)
     level = peer.get("relationshipLevel", "L0")
@@ -351,26 +379,27 @@ def _render_chat_panel(paths, peer_id: str, limit: int = 12) -> str:
     quick_shares = ", ".join(_available_quick_shares(level)) or "无"
     title = f"\n聊天页 · {peer.get('displayName') or peer['peerId']} [{peer['peerId']}]"
     share_lines = shares if shares else ["暂无最近分享"]
-    return "\n".join(
-        [
-            title,
-            "-" * 72,
-            f"关系等级: {level} {level_name}    状态: {peer.get('status', 'unknown')}",
-            f"快捷分享: {quick_shares}",
-            "最近分享:",
-            *(f"- {item}" for item in share_lines),
-            "-" * 72,
-            history,
-            "-" * 72,
-            "输入消息直接发送；/share <类型> 快捷分享；/r 刷新历史；/q 返回发现页",
-        ]
-    )
+    return "\n".join([
+        title,
+        "-" * 72,
+        f"关系等级: {level} {level_name}    状态: {peer.get('status', 'unknown')}",
+        f"快捷分享: {quick_shares}",
+        "最近分享:",
+        *(f"- {item}" for item in share_lines),
+        "-" * 72,
+        history,
+        "-" * 72,
+        "输入消息直接发送；/share <类型> 快捷分享；/r 刷新；/q 退出",
+    ])
 
 
 def _open_chat_panel(paths, peer_id: str) -> None:
     while True:
         print(_render_chat_panel(paths, peer_id), flush=True)
-        raw = input("chat> ").rstrip("\n")
+        try:
+            raw = input("chat> ").rstrip("\n")
+        except (EOFError, KeyboardInterrupt):
+            return
         if not raw:
             continue
         if raw.strip() == "/q":
@@ -406,20 +435,17 @@ def _render_discover_table(peers: list[dict]) -> str:
         return "未发现任何 ClawSoc 实例。"
     lines = ["\n发现结果", "-" * 72]
     for idx, peer in enumerate(peers, start=1):
-        status = peer.get("recordedStatus", "unknown")
-        level = peer.get("recordedLevel", "L0")
+        status = peer.get("status", "discovered")
+        level = peer.get("level", "L0")
         lines.append(
             f"[{idx}] {peer['displayName']} [{peer['peerId']}]  {status}/{level}  {peer['endpoint']}"
         )
         if peer.get("bio"):
             lines.append(f"     简介: {peer['bio']}")
-    lines.extend(
-        [
-            "-" * 72,
-            "操作: p <序号>=一键配对并进入聊天, c <序号>=复制邀请码, i <序号>=显示邀请码",
-            "      m <序号>=显示配对命令, r=重新扫描, q=退出",
-        ]
-    )
+    lines.extend([
+        "-" * 72,
+        "操作: p <序号>=配对并聊天  e <序号>=复制endpoint  r=重新扫描  q=退出",
+    ])
     return "\n".join(lines)
 
 
@@ -433,7 +459,8 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
         state = load_state(paths)
         peers = list(_discover_peers(paths, state, args).values())
         peers.sort(key=lambda item: (item.get("displayName") or "", item["peerId"]))
-        if args.record and peers:
+
+        if peers:
             for peer in peers:
                 upsert_peer(
                     paths,
@@ -450,22 +477,28 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
                         "lastSeenAt": utc_now(),
                     },
                 )
-            log_event(paths, "discover.recorded", {"count": len(peers), "peerIds": [peer["peerId"] for peer in peers]})
+            log_event(paths, "discover.recorded", {"count": len(peers), "peerIds": [p["peerId"] for p in peers]})
             save_state(paths, state)
             state = load_state(paths)
             for peer in peers:
                 existing = state.get("peers", {}).get(peer["peerId"], {})
-                peer["recordedStatus"] = existing.get("status", "unknown")
-                peer["recordedLevel"] = existing.get("relationshipLevel", "L0")
+                peer["status"] = existing.get("status", "discovered")
+                peer["level"] = existing.get("relationshipLevel", "L0")
 
         print(_render_discover_table(peers), flush=True)
         if not peers:
-            action = input("> ").strip().lower()
+            try:
+                action = input("> ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                return
             if action in {"q", "quit", "exit"}:
                 return
             continue
 
-        raw = input("> ").strip()
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
         if not raw:
             continue
         if raw.lower() in {"q", "quit", "exit"}:
@@ -475,7 +508,7 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
 
         parts = raw.split(maxsplit=1)
         if len(parts) != 2:
-            print("无效操作，请输入例如: p 1 / c 1 / i 1 / m 1 / r / q", flush=True)
+            print("无效操作，请输入: p <序号> / e <序号> / r / q", flush=True)
             continue
         action, index_str = parts[0].lower(), parts[1]
         try:
@@ -484,22 +517,17 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
             print("无效序号", flush=True)
             continue
 
-        if action == "c":
-            if _copy_to_clipboard(peer["invite"]):
-                print(f"已复制邀请码: {peer['peerId']}", flush=True)
+        if action == "e":
+            text = peer["endpoint"]
+            if _copy_to_clipboard(text):
+                print(f"已复制: {text}", flush=True)
             else:
-                print(peer["invite"], flush=True)
-            continue
-        if action == "i":
-            print(peer["invite"], flush=True)
-            continue
-        if action == "m":
-            print(peer["pairCommand"], flush=True)
-            print(peer["pairWithInviteCommand"], flush=True)
+                print(text, flush=True)
             continue
         if action == "p":
             try:
-                _pair_direct(paths.workspace_root, peer["peerId"], ttl=10)
+                _do_pair(paths, state, peer["endpoint"])
+                print(f"✅ 已配对: {peer['displayName']} [{peer['peerId']}]", flush=True)
             except SystemExit as exc:
                 print(str(exc), flush=True)
                 continue
@@ -508,19 +536,17 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
         print("未知操作", flush=True)
 
 
-def _get_peer_or_die(state: dict, peer_id: str, require_known: bool = False) -> dict:
+# ---------------------------------------------------------------------------
+# chat / history
+# ---------------------------------------------------------------------------
+
+def _get_active_peer(state: dict, peer_id: str) -> dict:
     peer = state.get("peers", {}).get(peer_id)
     if not peer:
-        raise SystemExit(f"Unknown peer: {peer_id}")
-    if not require_known and peer.get("status") != "active":
-        raise SystemExit(f"Peer {peer_id} is discovered but not paired yet")
+        raise SystemExit(f"Unknown peer: {peer_id}. Run 'discover --record' or 'pair' first.")
+    if peer.get("status") != "active":
+        raise SystemExit(f"Peer {peer_id} not paired. Run: pair {peer.get('endpoint') or peer_id}")
     return peer
-
-
-def cmd_peers(args: argparse.Namespace) -> None:
-    paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
-    state = load_state(paths)
-    print(json.dumps(list(state.get("peers", {}).values()), ensure_ascii=False, indent=2))
 
 
 def _send_chat_message(args: argparse.Namespace) -> dict:
@@ -528,7 +554,7 @@ def _send_chat_message(args: argparse.Namespace) -> dict:
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
-    peer = _get_peer_or_die(state, args.peer_id)
+    peer = _get_active_peer(state, args.peer_id)
     envelope = make_envelope(state["identity"]["id"], "chat.message", {"message": args.message})
     request_json(f"{peer['endpoint']}/clawsoc/message", envelope)
     peer["lastMessageAt"] = utc_now()
@@ -546,24 +572,28 @@ def cmd_chat(args: argparse.Namespace) -> None:
 def cmd_history(args: argparse.Namespace) -> None:
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = load_state(paths)
-    peer = _get_peer_or_die(state, args.peer_id)
+    peer = _get_active_peer(state, args.peer_id)
     history_path = paths.peers_dir / peer["peerId"] / "messages.jsonl"
     print(render_history(load_history(history_path), limit=args.limit))
 
+
+# ---------------------------------------------------------------------------
+# share
+# ---------------------------------------------------------------------------
 
 def cmd_share(args: argparse.Namespace) -> None:
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
-    peer = _get_peer_or_die(state, args.peer_id)
+    peer = _get_active_peer(state, args.peer_id)
     share_type = SHARE_TYPE_ALIASES.get(args.share_type, args.share_type)
     if share_type not in SHARE_MIN_LEVEL:
-        raise SystemExit(f"Unknown share type: {share_type}")
+        raise SystemExit(f"Unknown share type: {share_type}. Available: {', '.join(sorted(SHARE_MIN_LEVEL))}")
     min_level = SHARE_MIN_LEVEL[share_type]
     if not level_at_least(peer["relationshipLevel"], min_level):
         raise SystemExit(
-            f"Share type {share_type} requires {min_level}, current relationship is {peer['relationshipLevel']}"
+            f"Share type '{share_type}' requires {min_level}, current is {peer['relationshipLevel']}"
         )
     content = build_share_content(
         share_type,
@@ -584,6 +614,16 @@ def cmd_share(args: argparse.Namespace) -> None:
     log_event(paths, "share.sent", {"peerId": peer["peerId"], "shareType": share_type, "requestId": envelope["requestId"]})
     save_state(paths, state)
     print(json.dumps({"ok": True, "peerId": peer["peerId"], "shareType": share_type}, ensure_ascii=False, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# relationship / network / peers
+# ---------------------------------------------------------------------------
+
+def cmd_peers(args: argparse.Namespace) -> None:
+    paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
+    state = load_state(paths)
+    print(json.dumps(list(state.get("peers", {}).values()), ensure_ascii=False, indent=2))
 
 
 def cmd_network(args: argparse.Namespace) -> None:
@@ -611,15 +651,16 @@ def cmd_relationship(args: argparse.Namespace) -> None:
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = load_state(paths)
     subcommand = args.relationship_command
-    if subcommand == "list":
+
+    if subcommand in ("list", "列表"):
         print(json.dumps({"peers": list(state.get("peers", {}).values()), "pending": state.get("pending", {})}, ensure_ascii=False, indent=2))
         return
 
     if not state.get("identity"):
         state = init_state(paths)
-    peer = _get_peer_or_die(state, args.peer_id)
+    peer = _get_active_peer(state, args.peer_id)
 
-    if subcommand == "upgrade":
+    if subcommand in ("upgrade", "升级"):
         current_index = ["L0", "L1", "L2", "L3", "L4"].index(peer["relationshipLevel"])
         target_level = args.level or (["L0", "L1", "L2", "L3", "L4"][min(current_index + 1, 4)])
         target_level = normalize_level(target_level)
@@ -638,17 +679,17 @@ def cmd_relationship(args: argparse.Namespace) -> None:
         ]
         state["pending"]["upgradeRequests"].append(outbound)
         save_state(paths, state)
-        print(json.dumps({"ok": True, "request": response["request"]}, ensure_ascii=False, indent=2))
+        print(json.dumps({"ok": True, "request": response.get("request", outbound)}, ensure_ascii=False, indent=2))
         return
 
-    if subcommand == "accept-upgrade":
+    if subcommand in ("accept-upgrade", "接受升级"):
         request = None
         for item in state["pending"]["upgradeRequests"]:
             if item["fromPeerId"] == peer["peerId"] and item["status"] == "pending-inbound":
                 request = item
                 break
         if not request:
-            raise SystemExit(f"No pending inbound upgrade request from {peer['peerId']}")
+            raise SystemExit(f"No pending upgrade request from {peer['peerId']}")
         target_level = normalize_level(request["targetLevel"])
         peer["relationshipLevel"] = target_level
         peer["updatedAt"] = utc_now()
@@ -665,7 +706,7 @@ def cmd_relationship(args: argparse.Namespace) -> None:
         print(json.dumps({"ok": True, "peer": peer}, ensure_ascii=False, indent=2))
         return
 
-    if subcommand == "downgrade":
+    if subcommand in ("downgrade", "降级"):
         target_level = normalize_level(args.level)
         peer["relationshipLevel"] = target_level
         peer["updatedAt"] = utc_now()
@@ -677,100 +718,102 @@ def cmd_relationship(args: argparse.Namespace) -> None:
     raise SystemExit(f"Unknown relationship subcommand: {subcommand}")
 
 
-def cmd_serve(args: argparse.Namespace) -> None:
-    paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
-    state = init_state(paths, host=args.host, port=args.port)
-    app = {"paths": paths, "share_requirements": SHARE_MIN_LEVEL}
-    serve(app, args.host, args.port)
-
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="ClawSoc LAN MVP CLI")
+    parser = argparse.ArgumentParser(description="ClawSoc CLI v2 — simplified pairing")
     parser.add_argument("--workspace-root", help="Override workspace root")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = sub.add_parser("init", aliases=["初始化"])
-    init_parser.add_argument("--host", default="0.0.0.0")
-    init_parser.add_argument("--port", type=int, default=45678)
-    init_parser.add_argument("--force", action="store_true")
-    init_parser.set_defaults(func=cmd_init)
+    # init
+    init_p = sub.add_parser("init", aliases=["初始化"])
+    init_p.add_argument("--host", default="0.0.0.0")
+    init_p.add_argument("--port", type=int, default=45678)
+    init_p.add_argument("--force", action="store_true")
+    init_p.set_defaults(func=cmd_init)
 
-    identity_parser = sub.add_parser("identity", aliases=["身份"])
-    identity_parser.set_defaults(func=cmd_identity)
+    # identity
+    id_p = sub.add_parser("identity", aliases=["身份"])
+    id_p.set_defaults(func=cmd_identity)
 
-    invite_parser = sub.add_parser("invite", aliases=["邀请"])
-    invite_parser.add_argument("--ttl", type=int, default=10)
-    invite_parser.set_defaults(func=cmd_invite)
+    # discover
+    disc_p = sub.add_parser("discover", aliases=["发现"])
+    disc_p.add_argument("--cidr", help="CIDR to scan, e.g. 192.168.1.0/24")
+    disc_p.add_argument("--hosts", help="Comma-separated host list")
+    disc_p.add_argument("--ports", default="45678", help="Comma-separated port list")
+    disc_p.add_argument("--workers", type=int, default=32)
+    disc_p.add_argument("--timeout", type=float, default=0.6)
+    disc_p.add_argument("--record", action="store_true", help="Save discovered peers to state")
+    disc_p.set_defaults(func=cmd_discover)
 
-    discover_parser = sub.add_parser("discover", aliases=["发现"])
-    discover_parser.add_argument("--cidr", help="CIDR to scan, e.g. 192.168.1.0/24")
-    discover_parser.add_argument("--hosts", help="Comma-separated host list to scan")
-    discover_parser.add_argument("--ports", default="45678", help="Comma-separated port list")
-    discover_parser.add_argument("--workers", type=int, default=32)
-    discover_parser.add_argument("--timeout", type=float, default=0.6)
-    discover_parser.add_argument("--record", action="store_true", help="Record discovered peers into state")
-    discover_parser.set_defaults(func=cmd_discover)
+    # discover-ui
+    dui_p = sub.add_parser("discover-ui", aliases=["发现页"])
+    dui_p.add_argument("--cidr", help="CIDR to scan")
+    dui_p.add_argument("--hosts", help="Comma-separated host list")
+    dui_p.add_argument("--ports", default="45678")
+    dui_p.add_argument("--workers", type=int, default=32)
+    dui_p.add_argument("--timeout", type=float, default=0.6)
+    dui_p.set_defaults(func=cmd_discover_ui)
 
-    discover_ui_parser = sub.add_parser("discover-ui", aliases=["发现页", "发现面板"])
-    discover_ui_parser.add_argument("--cidr", help="CIDR to scan, e.g. 192.168.1.0/24")
-    discover_ui_parser.add_argument("--hosts", help="Comma-separated host list to scan")
-    discover_ui_parser.add_argument("--ports", default="45678", help="Comma-separated port list")
-    discover_ui_parser.add_argument("--workers", type=int, default=32)
-    discover_ui_parser.add_argument("--timeout", type=float, default=0.6)
-    discover_ui_parser.add_argument("--record", action="store_true", default=True, help="Record discovered peers into state")
-    discover_ui_parser.set_defaults(func=cmd_discover_ui)
+    # pair (simplified: takes endpoint, peer_id, or IP)
+    pair_p = sub.add_parser("pair", aliases=["配对"])
+    pair_p.add_argument("target", help="Endpoint URL, peer_id, or IP address")
+    pair_p.set_defaults(func=cmd_pair)
 
-    pair_parser = sub.add_parser("pair", aliases=["配对"])
-    pair_parser.add_argument("invite")
-    pair_parser.set_defaults(func=cmd_pair)
+    # peers
+    peers_p = sub.add_parser("peers", aliases=["伙伴"])
+    peers_p.set_defaults(func=cmd_peers)
 
-    pair_direct_parser = sub.add_parser("pair-direct", aliases=["一键配对", "快速配对"])
-    pair_direct_parser.add_argument("peer_id")
-    pair_direct_parser.add_argument("--ttl", type=int, default=10)
-    pair_direct_parser.set_defaults(func=cmd_pair_direct)
+    # chat
+    chat_p = sub.add_parser("chat", aliases=["聊天"])
+    chat_p.add_argument("peer_id")
+    chat_p.add_argument("message")
+    chat_p.set_defaults(func=cmd_chat)
 
-    peers_parser = sub.add_parser("peers", aliases=["对等体", "伙伴"])
-    peers_parser.set_defaults(func=cmd_peers)
+    # history
+    hist_p = sub.add_parser("history", aliases=["历史"])
+    hist_p.add_argument("peer_id")
+    hist_p.add_argument("--limit", type=int, default=20)
+    hist_p.set_defaults(func=cmd_history)
 
-    chat_parser = sub.add_parser("chat", aliases=["聊天"])
-    chat_parser.add_argument("peer_id")
-    chat_parser.add_argument("message")
-    chat_parser.set_defaults(func=cmd_chat)
+    # share
+    share_p = sub.add_parser("share", aliases=["分享"])
+    share_p.add_argument("share_type")
+    share_p.add_argument("peer_id")
+    share_p.add_argument("item", nargs="?", default="")
+    share_p.set_defaults(func=cmd_share)
 
-    history_parser = sub.add_parser("history", aliases=["历史"])
-    history_parser.add_argument("peer_id")
-    history_parser.add_argument("--limit", type=int, default=20)
-    history_parser.set_defaults(func=cmd_history)
+    # relationship
+    rel_p = sub.add_parser("relationship", aliases=["关系"])
+    rel_sub = rel_p.add_subparsers(dest="relationship_command", required=True)
 
-    share_parser = sub.add_parser("share", aliases=["分享"])
-    share_parser.add_argument("share_type")
-    share_parser.add_argument("peer_id")
-    share_parser.add_argument("item", nargs="?", default="")
-    share_parser.set_defaults(func=cmd_share)
+    rel_sub.add_parser("list", aliases=["列表"]).set_defaults(func=cmd_relationship)
 
-    relationship_parser = sub.add_parser("relationship", aliases=["关系"])
-    relationship_sub = relationship_parser.add_subparsers(dest="relationship_command", required=True)
-    rel_list = relationship_sub.add_parser("list", aliases=["列表"])
-    rel_list.set_defaults(func=cmd_relationship)
-    rel_up = relationship_sub.add_parser("upgrade", aliases=["升级"])
+    rel_up = rel_sub.add_parser("upgrade", aliases=["升级"])
     rel_up.add_argument("peer_id")
     rel_up.add_argument("level", nargs="?")
     rel_up.set_defaults(func=cmd_relationship)
-    rel_accept = relationship_sub.add_parser("accept-upgrade", aliases=["接受升级"])
-    rel_accept.add_argument("peer_id")
-    rel_accept.set_defaults(func=cmd_relationship)
-    rel_down = relationship_sub.add_parser("downgrade", aliases=["降级"])
+
+    rel_acc = rel_sub.add_parser("accept-upgrade", aliases=["接受升级"])
+    rel_acc.add_argument("peer_id")
+    rel_acc.set_defaults(func=cmd_relationship)
+
+    rel_down = rel_sub.add_parser("downgrade", aliases=["降级"])
     rel_down.add_argument("peer_id")
     rel_down.add_argument("level")
     rel_down.set_defaults(func=cmd_relationship)
 
-    serve_parser = sub.add_parser("serve", aliases=["服务", "监听"])
-    serve_parser.add_argument("--host", default="0.0.0.0")
-    serve_parser.add_argument("--port", type=int, default=45678)
-    serve_parser.set_defaults(func=cmd_serve)
+    # serve
+    serve_p = sub.add_parser("serve", aliases=["服务", "监听"])
+    serve_p.add_argument("--host", default="0.0.0.0")
+    serve_p.add_argument("--port", type=int, default=45678)
+    serve_p.set_defaults(func=cmd_serve)
 
-    network_parser = sub.add_parser("network", aliases=["网络"])
-    network_parser.set_defaults(func=cmd_network)
+    # network
+    net_p = sub.add_parser("network", aliases=["网络"])
+    net_p.set_defaults(func=cmd_network)
 
     return parser
 
