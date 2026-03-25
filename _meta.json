@@ -1,0 +1,6 @@
+{
+  "slug": "clawsoc",
+  "version": "0.1.0",
+  "entry": "scripts/clawsoc_cli.py",
+  "runtime": "python3"
+}

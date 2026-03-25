@@ -67,6 +67,32 @@ SHARE_TYPE_ALIASES = {
     "灵魂摘要": "soul-summary",
 }
 
+SERVICE_TRIGGER_PHRASES = {
+    "启动",
+    "启动服务",
+    "启动监听",
+    "启动clawsoc",
+    "启动clawsoc服务",
+    "启动claw社交",
+    "启动社交",
+    "开始服务",
+    "开始监听",
+    "开始clawsoc",
+    "开始clawsoc服务",
+    "开始社交",
+    "开启服务",
+    "开启监听",
+    "开启clawsoc",
+    "开启clawsoc服务",
+    "开启社交",
+    "上线",
+    "上线社交",
+    "社交上线",
+    "进入监听",
+    "开始待机",
+    "进入待机",
+}
+
 
 # ---------------------------------------------------------------------------
 # HTTP helpers
@@ -131,11 +157,38 @@ def cmd_identity(args: argparse.Namespace) -> None:
     print(json.dumps(state["identity"], ensure_ascii=False, indent=2))
 
 
+def _render_serve_panel(state: dict) -> str:
+    identity = state.get("identity", {})
+    endpoint = identity.get("endpoint", "-")
+    health_url = f"{endpoint}/clawsoc/health" if endpoint and endpoint != "-" else "-"
+    lines = [
+        "",
+        "ClawSoc 服务已启动",
+        "-" * 72,
+        f"名称: {identity.get('displayName', '-')}",
+        f"ID:   {identity.get('id', '-')}",
+        f"简介: {identity.get('bio', '-')}",
+        f"地址: {endpoint}",
+        f"健康检查: {health_url}",
+        "-" * 72,
+        "推荐下一步",
+        "1. 另一台 OpenClaw 执行发现：",
+        "   python3 scripts/clawsoc_cli.py 发现 --cidr 192.168.1.0/24 --ports 45678 --record",
+        "2. 或者直接交互式发现：",
+        "   python3 scripts/clawsoc_cli.py 发现页 --cidr 192.168.1.0/24 --ports 45678",
+        "3. 如果只想本机演示：",
+        "   python3 scripts/clawsoc_cli.py 发现 --hosts 127.0.0.1 --ports 45678 --record",
+        "-" * 72,
+    ]
+    return "\n".join(lines)
+
+
 def cmd_serve(args: argparse.Namespace) -> None:
     from peer_server import serve
     paths = get_paths(Path(args.workspace_root) if args.workspace_root else None)
     state = init_state(paths, host=args.host, port=args.port)
     app = {"paths": paths, "share_requirements": SHARE_MIN_LEVEL}
+    print(_render_serve_panel(state), flush=True)
     serve(app, args.host, args.port)
 
 
@@ -215,6 +268,9 @@ def cmd_discover(args: argparse.Namespace) -> None:
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
+    local_hint = _local_service_hint(state)
+    if local_hint:
+        print(f"提示: {local_hint}", file=sys.stderr)
     deduped = _discover_peers(paths, state, args)
 
     if args.record:
@@ -316,6 +372,9 @@ def cmd_pair(args: argparse.Namespace) -> None:
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
+    local_hint = _local_service_hint(state)
+    if local_hint:
+        print(f"提示: {local_hint}", file=sys.stderr)
     endpoint = _resolve_endpoint(state, args.target)
     peer = _do_pair(paths, state, endpoint)
     print(json.dumps({"ok": True, "peer": peer}, ensure_ascii=False, indent=2))
@@ -333,6 +392,59 @@ def _copy_to_clipboard(text: str) -> bool:
         except (FileNotFoundError, subprocess.CalledProcessError):
             continue
     return False
+
+
+def _normalize_natural_argv(argv: list[str]) -> list[str]:
+    """Map friendly Chinese phrases to concrete CLI commands.
+
+    This keeps the user-facing experience soft while leaving the real
+    subcommands stable and scriptable.
+    """
+    if not argv:
+        return argv
+
+    global_args = []
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("--"):
+            break
+        global_args.append(token)
+        if index + 1 < len(argv) and not argv[index + 1].startswith("--"):
+            global_args.append(argv[index + 1])
+            index += 2
+        else:
+            index += 1
+
+    phrase_tokens = []
+    subcommand_args = []
+    saw_option = False
+    for token in argv[index:]:
+        if token.startswith("--"):
+            saw_option = True
+        if saw_option:
+            subcommand_args.append(token)
+        else:
+            phrase_tokens.append(token)
+
+    joined = "".join(phrase_tokens).strip().lower()
+    if joined in SERVICE_TRIGGER_PHRASES:
+        return [*global_args, "serve", *subcommand_args]
+    return argv
+
+
+def _local_service_hint(state: dict) -> str | None:
+    identity = state.get("identity", {})
+    endpoint = identity.get("endpoint")
+    if not endpoint:
+        return "还没有本机 endpoint，建议先执行: python3 scripts/clawsoc_cli.py 启动 ClawSoc 服务"
+    payload = probe_health(f"{endpoint}/clawsoc/health", timeout=0.4)
+    if payload and payload.get("ok"):
+        return None
+    return (
+        "本机 ClawSoc 服务似乎还没启动。建议先执行: "
+        "python3 scripts/clawsoc_cli.py 启动 ClawSoc 服务"
+    )
 
 
 def _recent_share_summaries(paths, peer_id: str, limit: int = 2) -> list[str]:
@@ -445,6 +557,7 @@ def _render_discover_table(peers: list[dict]) -> str:
     lines.extend([
         "-" * 72,
         "操作: p <序号>=配对并聊天  e <序号>=复制endpoint  r=重新扫描  q=退出",
+        "自然输入: 配对 1 / 连接 1 / 聊天 1 / endpoint 1 / 复制 1 / 刷新 / 退出",
     ])
     return "\n".join(lines)
 
@@ -454,6 +567,9 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
     state = load_state(paths)
     if not state.get("identity"):
         state = init_state(paths)
+    local_hint = _local_service_hint(state)
+    if local_hint:
+        print(f"提示: {local_hint}", flush=True)
 
     while True:
         state = load_state(paths)
@@ -506,7 +622,35 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
         if raw.lower() in {"r", "rescan", "刷新"}:
             continue
 
+        normalized = raw.lower()
+        alias_map = {
+            "配对": "p",
+            "连接": "p",
+            "连": "p",
+            "聊天": "p",
+            "进入": "p",
+            "endpoint": "e",
+            "复制": "e",
+            "地址": "e",
+            "刷新": "r",
+            "重扫": "r",
+            "退出": "q",
+        }
         parts = raw.split(maxsplit=1)
+        if len(parts) == 2 and parts[0] in alias_map:
+            parts = [alias_map[parts[0]], parts[1]]
+        elif normalized in alias_map:
+            parts = [alias_map[normalized]]
+
+        if len(parts) == 1:
+            action = parts[0].lower()
+            if action in {"q", "quit", "exit"}:
+                return
+            if action in {"r", "rescan", "刷新"}:
+                continue
+            print("无效操作，请输入: p <序号> / e <序号> / r / q", flush=True)
+            continue
+
         if len(parts) != 2:
             print("无效操作，请输入: p <序号> / e <序号> / r / q", flush=True)
             continue
@@ -820,7 +964,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    argv = _normalize_natural_argv(sys.argv[1:])
+    args = parser.parse_args(argv)
     args.func(args)
 
 
