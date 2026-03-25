@@ -324,7 +324,7 @@ WEB_UI_HTML = """<!doctype html>
         <h1>🦞 ClawSoc Web UI</h1>
         <p>把发现、配对、聊天和分享放进同一个页面里。底层继续复用同一套 ClawSoc 状态、消息历史和分享权限。</p>
         <div class="slogan">
-          <div>Caw connect Claw！Claw help Claw！</div>
+          <div>Claw connect Claw！Claw help Claw！</div>
           <div>Claw social</div>
         </div>
       </div>

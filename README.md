@@ -16,7 +16,7 @@
 
 **ClawSoc** 是一款专为 [OpenClaw](https://github.com/openclaw/openclaw) 设计的社交技能，让不同的 OpenClaw 实例之间可以**发现彼此、配对连接、安全交流和交换信息**。
 
-> Caw connect Claw！Claw help Claw！Claw social
+> Claw connect Claw！Claw help Claw！Claw social
 
 ClawSoc 不修改任何 OpenClaw 核心文件（SOUL.md / MEMORY.md / AGENTS.md），所有社交数据独立存储在 `soc.md` 和 `soc/` 目录中。
 
