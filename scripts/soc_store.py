@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 RELATIONSHIP_LEVELS = ["L0", "L1", "L2", "L3", "L4"]
 LEVEL_NAMES = {
@@ -122,6 +123,10 @@ def level_at_least(current: str, minimum: str) -> bool:
     return RELATIONSHIP_LEVELS.index(current) >= RELATIONSHIP_LEVELS.index(minimum)
 
 
+def level_strictly_higher(target: str, current: str) -> bool:
+    return RELATIONSHIP_LEVELS.index(target) > RELATIONSHIP_LEVELS.index(current)
+
+
 def infer_local_ip() -> str:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -131,6 +136,36 @@ def infer_local_ip() -> str:
         return ip
     except OSError:
         return "127.0.0.1"
+
+
+def ui_urls_from_state(state: dict[str, Any]) -> list[str]:
+    identity = state.get("identity", {})
+    settings = state.get("settings", {})
+    bind_host = str(settings.get("host") or identity.get("host") or "0.0.0.0")
+    port = int(settings.get("port") or 45678)
+    urls: list[str] = []
+
+    def add(host: str) -> None:
+        host = str(host or "").strip()
+        if not host:
+            return
+        url = f"http://{host}:{port}/clawsoc/ui"
+        if url not in urls:
+            urls.append(url)
+
+    if bind_host in {"0.0.0.0", "::", ""}:
+        add("127.0.0.1")
+        add("localhost")
+    else:
+        add(bind_host)
+
+    endpoint = str(identity.get("endpoint") or "").strip()
+    if endpoint:
+        parsed = urlparse(endpoint)
+        if parsed.hostname:
+            add(parsed.hostname)
+
+    return urls
 
 
 def identity_from_env(host: str | None = None, port: int | None = None) -> dict[str, Any]:

@@ -32,6 +32,7 @@ from soc_store import (
     SHARE_MIN_LEVEL,
     get_paths,
     init_state,
+    level_strictly_higher,
     level_at_least,
     load_state,
     log_event,
@@ -40,6 +41,7 @@ from soc_store import (
     normalize_level,
     save_state,
     upsert_peer,
+    ui_urls_from_state,
     utc_now,
 )
 
@@ -161,6 +163,7 @@ def _render_serve_panel(state: dict) -> str:
     identity = state.get("identity", {})
     endpoint = identity.get("endpoint", "-")
     health_url = f"{endpoint}/clawsoc/health" if endpoint and endpoint != "-" else "-"
+    ui_urls = ui_urls_from_state(state)
     lines = [
         "",
         "ClawSoc 服务已启动",
@@ -168,8 +171,9 @@ def _render_serve_panel(state: dict) -> str:
         f"名称: {identity.get('displayName', '-')}",
         f"ID:   {identity.get('id', '-')}",
         f"简介: {identity.get('bio', '-')}",
-        f"地址: {endpoint}",
+        f"配对地址: {endpoint}",
         f"健康检查: {health_url}",
+        f"Web UI: {ui_urls[0] if ui_urls else '-'}",
         "-" * 72,
         "推荐下一步",
         "1. 另一台 OpenClaw 执行发现：",
@@ -180,6 +184,8 @@ def _render_serve_panel(state: dict) -> str:
         "   python3 scripts/clawsoc_cli.py 发现 --hosts 127.0.0.1 --ports 45678 --record",
         "-" * 72,
     ]
+    if len(ui_urls) > 1:
+        lines.insert(8, f"备用 Web UI: {', '.join(ui_urls[1:])}")
     return "\n".join(lines)
 
 
@@ -808,6 +814,10 @@ def cmd_relationship(args: argparse.Namespace) -> None:
         current_index = ["L0", "L1", "L2", "L3", "L4"].index(peer["relationshipLevel"])
         target_level = args.level or (["L0", "L1", "L2", "L3", "L4"][min(current_index + 1, 4)])
         target_level = normalize_level(target_level)
+        if not level_strictly_higher(target_level, peer["relationshipLevel"]):
+            raise SystemExit(
+                f"Relationship upgrade must be higher than current level {peer['relationshipLevel']}, got {target_level}"
+            )
         envelope = make_envelope(state["identity"]["id"], "relationship.upgrade", {"targetLevel": target_level})
         response = request_json(f"{peer['endpoint']}/clawsoc/relationship/upgrade", envelope)
         outbound = {

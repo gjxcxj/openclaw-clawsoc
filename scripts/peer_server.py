@@ -13,13 +13,16 @@ from urllib.parse import parse_qs, urlparse
 
 from soc_store import (
     LEVEL_NAMES,
+    RELATIONSHIP_LEVELS,
     level_at_least,
+    level_strictly_higher,
     load_state,
     log_event,
     log_message,
     log_share,
     normalize_level,
     save_state,
+    ui_urls_from_state,
     upsert_peer,
     utc_now,
 )
@@ -32,103 +35,116 @@ WEB_UI_HTML = """<!doctype html>
   <title>🦞 ClawSoc Web UI</title>
   <style>
     :root {
-      --bg: #f3efe5;
-      --panel: rgba(255,255,255,.84);
-      --line: #d8ccb4;
-      --text: #1f2a25;
-      --muted: #607167;
+      --bg: #f4efe7;
+      --panel: rgba(255,255,255,.9);
+      --panel-strong: rgba(255,255,255,.96);
+      --line: #ddd3c4;
+      --text: #1e2925;
+      --muted: #68786d;
       --accent: #1d6b52;
-      --accent-2: #d97d54;
-      --chip: #eef5ef;
+      --accent-2: #cb6f47;
+      --chip: #edf4ef;
+      --soft: #f7f2ea;
       --danger: #9b3d30;
-      --shadow: 0 20px 60px rgba(63, 51, 37, 0.12);
+      --shadow: 0 18px 40px rgba(63, 51, 37, 0.1);
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "PingFang SC", "Noto Sans SC", "Helvetica Neue", sans-serif;
+      font-family: "SF Pro Display", "PingFang SC", "Noto Sans SC", sans-serif;
       color: var(--text);
       background:
-        radial-gradient(circle at top left, rgba(217,125,84,.18), transparent 32%),
-        radial-gradient(circle at top right, rgba(29,107,82,.12), transparent 28%),
-        linear-gradient(180deg, #f7f2e9 0%, var(--bg) 100%);
+        radial-gradient(circle at top left, rgba(203,111,71,.14), transparent 26%),
+        radial-gradient(circle at top right, rgba(29,107,82,.09), transparent 24%),
+        linear-gradient(180deg, #fbf7f1 0%, var(--bg) 100%);
       min-height: 100vh;
     }
     .shell {
-      max-width: 1360px;
+      max-width: 1440px;
       margin: 0 auto;
-      padding: 28px;
+      padding: 28px 32px 36px;
     }
     .hero {
-      display: flex;
-      justify-content: space-between;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 20px;
-      align-items: end;
-      margin-bottom: 22px;
+      align-items: start;
+      margin-bottom: 18px;
     }
     .hero h1 {
       margin: 0;
-      font-size: 42px;
+      font-size: 46px;
       letter-spacing: -0.04em;
     }
     .hero p {
-      margin: 8px 0 0;
+      margin: 10px 0 0;
       color: var(--muted);
-      max-width: 720px;
-      line-height: 1.6;
+      max-width: 760px;
+      line-height: 1.7;
+      font-size: 16px;
     }
     .hero .slogan {
-      margin-top: 10px;
-      display: grid;
-      gap: 4px;
+      margin-top: 14px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
       color: var(--accent);
       font-weight: 700;
-      letter-spacing: .02em;
+      letter-spacing: .01em;
     }
     .pill {
       display: inline-flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 14px;
+      padding: 10px 16px;
       border-radius: 999px;
-      background: rgba(255,255,255,.7);
+      background: rgba(255,255,255,.88);
       border: 1px solid rgba(29,107,82,.16);
       color: var(--accent);
       font-weight: 700;
       white-space: nowrap;
+      box-shadow: 0 8px 20px rgba(63, 51, 37, 0.06);
     }
     .grid {
       display: grid;
-      grid-template-columns: 340px minmax(0, 1fr);
-      gap: 18px;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 20px;
     }
     .left, .right {
       display: grid;
-      gap: 18px;
+      gap: 14px;
       align-content: start;
     }
     .card {
       background: var(--panel);
       border: 1px solid rgba(116, 104, 82, .18);
-      border-radius: 24px;
+      border-radius: 28px;
       box-shadow: var(--shadow);
       backdrop-filter: blur(16px);
-      padding: 18px;
+      padding: 20px;
     }
     .card h2 {
-      margin: 0 0 12px;
-      font-size: 18px;
+      margin: 0 0 8px;
+      font-size: 15px;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: var(--muted);
     }
     .identity strong {
       display: block;
-      font-size: 22px;
+      font-size: 24px;
+      line-height: 1.25;
     }
     .meta {
-      margin-top: 12px;
+      margin-top: 14px;
       display: grid;
-      gap: 8px;
+      gap: 10px;
       font-size: 14px;
       color: var(--muted);
+    }
+    .meta strong {
+      color: var(--text);
+      font-weight: 700;
     }
     .row { display: grid; gap: 10px; }
     .label { font-size: 13px; color: var(--muted); font-weight: 700; }
@@ -138,29 +154,42 @@ WEB_UI_HTML = """<!doctype html>
     input, textarea, select {
       width: 100%;
       border: 1px solid var(--line);
-      border-radius: 14px;
-      background: rgba(255,255,255,.9);
+      border-radius: 16px;
+      background: rgba(255,255,255,.95);
       padding: 12px 14px;
       color: var(--text);
       outline: none;
     }
-    textarea { min-height: 94px; resize: vertical; }
+    input:focus, textarea:focus {
+      border-color: rgba(29,107,82,.28);
+      box-shadow: 0 0 0 4px rgba(29,107,82,.08);
+    }
+    textarea { min-height: 88px; resize: vertical; }
     button {
       border: 0;
-      border-radius: 14px;
-      padding: 11px 14px;
+      border-radius: 16px;
+      padding: 11px 16px;
       background: var(--accent);
       color: white;
       cursor: pointer;
       font-weight: 700;
+      transition: transform .14s ease, box-shadow .14s ease, opacity .14s ease;
+    }
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 18px rgba(29,107,82,.16);
+    }
+    button:disabled {
+      cursor: default;
+      opacity: .72;
     }
     button.secondary {
-      background: white;
+      background: var(--panel-strong);
       color: var(--accent);
       border: 1px solid rgba(29,107,82,.2);
     }
     button.ghost {
-      background: rgba(29,107,82,.08);
+      background: rgba(29,107,82,.07);
       color: var(--accent);
     }
     .actions {
@@ -170,23 +199,26 @@ WEB_UI_HTML = """<!doctype html>
     }
     .peers {
       display: grid;
-      gap: 12px;
-      max-height: 360px;
+      gap: 10px;
+      max-height: 420px;
       overflow: auto;
       padding-right: 4px;
     }
     .peer {
       border: 1px solid rgba(116, 104, 82, .18);
-      border-radius: 18px;
+      border-radius: 20px;
       padding: 14px;
-      background: rgba(255,255,255,.62);
+      background: rgba(255,255,255,.76);
       cursor: pointer;
-      transition: transform .15s ease, border-color .15s ease, background .15s ease;
+      transition: transform .15s ease, border-color .15s ease, background .15s ease, box-shadow .15s ease;
     }
-    .peer:hover { transform: translateY(-1px); }
+    .peer:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(63, 51, 37, 0.06);
+    }
     .peer.active {
       border-color: rgba(29,107,82,.5);
-      background: rgba(232,247,239,.92);
+      background: rgba(237,247,241,.96);
     }
     .peer-head {
       display: flex;
@@ -200,6 +232,7 @@ WEB_UI_HTML = """<!doctype html>
       display: flex;
       align-items: center;
       gap: 8px;
+      font-size: 15px;
     }
     .chip {
       display: inline-flex;
@@ -211,33 +244,96 @@ WEB_UI_HTML = """<!doctype html>
       font-size: 12px;
       font-weight: 700;
     }
+    .chip.connected {
+      background: rgba(29,107,82,.14);
+      color: var(--accent);
+    }
+    .chip.discovered {
+      background: rgba(217,125,84,.12);
+      color: var(--accent-2);
+    }
+    .chip.pending {
+      background: rgba(31,42,37,.08);
+      color: var(--text);
+    }
     .peer-sub {
       color: var(--muted);
       font-size: 13px;
       line-height: 1.5;
     }
+    .peer-endpoint {
+      font-family: "SF Mono", "JetBrains Mono", monospace;
+      font-size: 12px;
+      color: #7c847c;
+    }
+    .peer-summary {
+      padding-top: 8px;
+      border-top: 1px dashed rgba(116, 104, 82, .18);
+    }
     .chat-shell {
       display: grid;
-      gap: 14px;
+      gap: 16px;
     }
     .chat-head {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 16px;
       flex-wrap: wrap;
+    }
+    .chat-head h2 {
+      margin: 0;
+      color: var(--text);
+      text-transform: none;
+      letter-spacing: -0.02em;
+      font-size: 32px;
     }
     .chat-meta {
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
     }
+    .chat-topline {
+      color: var(--muted);
+      line-height: 1.6;
+      margin-top: 8px;
+    }
+    .status-bar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: start;
+      padding: 14px 16px;
+      border-radius: 20px;
+      background: var(--soft);
+      border: 1px solid rgba(116, 104, 82, .14);
+    }
+    .status-copy {
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }
+    .section {
+      display: grid;
+      gap: 10px;
+    }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+    }
+    .section-head .label {
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
     .messages {
       border: 1px solid rgba(116, 104, 82, .16);
       border-radius: 22px;
-      background: rgba(255,255,255,.66);
+      background: rgba(255,255,255,.7);
       padding: 18px;
-      min-height: 360px;
+      min-height: 320px;
       max-height: 520px;
       overflow: auto;
       display: grid;
@@ -277,13 +373,16 @@ WEB_UI_HTML = """<!doctype html>
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
-      margin-top: 6px;
     }
     .share-list {
       display: grid;
       gap: 8px;
       color: var(--muted);
       font-size: 14px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255,255,255,.52);
+      border: 1px solid rgba(116, 104, 82, .12);
     }
     .placeholder {
       color: var(--muted);
@@ -297,10 +396,12 @@ WEB_UI_HTML = """<!doctype html>
       font-size: 14px;
     }
     .notice.error { color: var(--danger); }
+    .notice.success { color: var(--accent); }
     .inline-form {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 10px;
+      align-items: end;
     }
     .toolbar {
       display: flex;
@@ -312,6 +413,7 @@ WEB_UI_HTML = """<!doctype html>
     @media (max-width: 980px) {
       .grid { grid-template-columns: 1fr; }
       .hero { flex-direction: column; align-items: start; }
+      .status-bar { grid-template-columns: 1fr; }
       .messages { min-height: 280px; }
       .msg { max-width: 90%; }
     }
@@ -324,8 +426,9 @@ WEB_UI_HTML = """<!doctype html>
         <h1>🦞 ClawSoc Web UI</h1>
         <p>把发现、配对、聊天和分享放进同一个页面里。底层继续复用同一套 ClawSoc 状态、消息历史和分享权限。</p>
         <div class="slogan">
-          <div>Claw connect Claw！Claw help Claw！</div>
-          <div>Claw social</div>
+          <div class="pill">单向配对</div>
+          <div class="pill">实时同步</div>
+          <div class="pill">关系分级分享</div>
         </div>
       </div>
       <div class="pill" id="service-pill">正在加载本机状态…</div>
@@ -338,8 +441,9 @@ WEB_UI_HTML = """<!doctype html>
           <strong id="identity-name">-</strong>
           <div id="identity-bio" class="meta"></div>
           <div class="meta">
-            <div>Claw ID: <span id="identity-id">-</span></div>
-            <div>Endpoint: <span id="identity-endpoint">-</span></div>
+            <div><strong>Claw ID</strong> <span id="identity-id">-</span></div>
+            <div><strong>配对地址</strong> <span id="identity-endpoint">-</span></div>
+            <div><strong>本机打开</strong> <span id="identity-ui-url">-</span></div>
           </div>
         </section>
 
@@ -379,30 +483,43 @@ WEB_UI_HTML = """<!doctype html>
           <div class="chat-head">
             <div>
               <h2 id="chat-title">交流界面</h2>
-              <div class="notice" id="chat-subtitle">选择左侧一位龙虾，或先执行发现。</div>
+              <div class="chat-topline" id="chat-subtitle">选择左侧一位龙虾，或先执行发现。</div>
             </div>
+          </div>
+
+          <div class="status-bar">
+            <div class="status-copy" id="status-copy">选中一位龙虾后，这里会告诉你当前连接状态和下一步动作。</div>
             <div class="chat-meta" id="chat-meta"></div>
           </div>
 
           <div class="primary-actions" id="peer-actions"></div>
 
-          <div>
-            <div class="label">最近分享</div>
+          <div class="section">
+            <div class="section-head">
+              <div class="label">最近分享</div>
+            </div>
             <div class="share-list" id="recent-shares">
               <div class="placeholder" style="padding:12px 0;">暂无最近分享</div>
             </div>
           </div>
 
-          <div class="messages" id="messages">
+          <div class="section">
+            <div class="section-head">
+              <div class="label">聊天记录</div>
+            </div>
+            <div class="messages" id="messages">
             <div class="placeholder">配对成功后，这里会显示对话历史。你也可以直接从这里发消息和快捷分享。</div>
+            </div>
           </div>
 
-          <div>
-            <div class="label">快捷分享</div>
+          <div class="section">
+            <div class="section-head">
+              <div class="label">快捷分享</div>
+            </div>
             <div class="shares" id="quick-shares"></div>
           </div>
 
-          <div class="row">
+          <div class="section">
             <label class="label" for="message-input">发送消息</label>
             <div class="inline-form">
               <textarea id="message-input" placeholder="输入一句话，配对后直接发送"></textarea>
@@ -420,9 +537,66 @@ WEB_UI_HTML = """<!doctype html>
       selectedPeerId: null,
       selectedPeer: null,
       eventSource: null,
+      pairingPeerId: null,
     };
 
     const el = (id) => document.getElementById(id);
+
+    function peerStatusLabel(peer) {
+      if (peer.status === "active") {
+        return "已连接";
+      }
+      if (state.pairingPeerId && peer.peerId === state.pairingPeerId) {
+        return "正在配对";
+      }
+      return "已发现";
+    }
+
+    function peerStatusClass(peer) {
+      if (peer.status === "active") {
+        return "connected";
+      }
+      if (state.pairingPeerId && peer.peerId === state.pairingPeerId) {
+        return "pending";
+      }
+      return "discovered";
+    }
+
+    function connectionSummary(peer) {
+      if (peer.status === "active") {
+        return "单向配对已完成，双方现在可以直接聊天。";
+      }
+      if (state.pairingPeerId && peer.peerId === state.pairingPeerId) {
+        return "正在向对方发起连接，请稍等状态同步。";
+      }
+      return "已被发现，点击一次即可发起连接；对方无需再点配对。";
+    }
+
+    function describeEvent(event) {
+      const payload = event?.payload || {};
+      if (event?.kind === "pair.completed") {
+        return `已向 ${payload.peerId || "对方"} 发起连接，连接建立完成。`;
+      }
+      if (event?.kind === "pair.accepted") {
+        return `${payload.peerId || "有新的 Claw"} 已与你建立连接。`;
+      }
+      if (event?.kind === "pair.connected") {
+        return `${payload.displayName || payload.peerId || "对方"} 已与你完成连接。`;
+      }
+      if (event?.kind === "message.received") {
+        return `收到来自 ${payload.peerId || "对方"} 的新消息。`;
+      }
+      if (event?.kind === "share.sent") {
+        return `已向 ${payload.peerId || "对方"} 分享 ${payload.shareType || "内容"}。`;
+      }
+      if (event?.kind === "relationship.upgrade.requested") {
+        return `${payload.fromPeerId || "对方"} 发来了关系升级请求。`;
+      }
+      if (event?.kind === "relationship.upgrade.accepted") {
+        return `${payload.peerId || "对方"} 的关系升级已生效。`;
+      }
+      return "";
+    }
 
     async function request(path, options = {}) {
       const response = await fetch(path, {
@@ -436,18 +610,21 @@ WEB_UI_HTML = """<!doctype html>
       return data;
     }
 
-    function setNotice(id, message, isError = false) {
+    function setNotice(id, message, tone = "info") {
       const node = el(id);
       node.textContent = message || "";
-      node.classList.toggle("error", Boolean(message && isError));
+      node.classList.toggle("error", Boolean(message && tone === "error"));
+      node.classList.toggle("success", Boolean(message && tone === "success"));
     }
 
-    function renderIdentity(identity) {
+    function renderIdentity(identity, uiUrls = []) {
       el("identity-name").textContent = `${identity.emoji || "🐾"} ${identity.displayName || "-"}`;
       el("identity-bio").textContent = identity.bio || "一个正在学习社交协作的 Claw";
       el("identity-id").textContent = identity.id || "-";
       el("identity-endpoint").textContent = identity.endpoint || "-";
-      el("service-pill").textContent = `本机在线 · ${identity.endpoint || "-"}`;
+      const uiUrl = uiUrls[0] || `http://127.0.0.1:${identity.port || 45678}/clawsoc/ui`;
+      el("identity-ui-url").textContent = uiUrl;
+      el("service-pill").textContent = `本机 Web UI · ${uiUrl}`;
     }
 
     function renderPeerList(peers) {
@@ -459,14 +636,17 @@ WEB_UI_HTML = """<!doctype html>
       list.innerHTML = peers.map((peer) => {
         const active = peer.peerId === state.selectedPeerId ? "active" : "";
         const label = `${peer.relationshipLevel || "L0"} ${peer.levelName || ""}`.trim();
+        const statusLabel = peerStatusLabel(peer);
+        const statusClass = peerStatusClass(peer);
         return `
           <article class="peer ${active}" data-peer-id="${peer.peerId}">
             <div class="peer-head">
               <div class="peer-title">${peer.emoji || "🐾"} ${peer.displayName || peer.peerId}</div>
-              <div class="chip">${peer.status || "discovered"} / ${label}</div>
+              <div class="chip ${statusClass}">${statusLabel} / ${label}</div>
             </div>
             <div class="peer-sub">${peer.bio || "暂无简介"}</div>
-            <div class="peer-sub" style="margin-top:8px;">${peer.endpoint || "-"}</div>
+            <div class="peer-sub peer-endpoint" style="margin-top:8px;">${peer.endpoint || "-"}</div>
+            <div class="peer-sub peer-summary">${connectionSummary(peer)}</div>
           </article>
         `;
       }).join("");
@@ -528,8 +708,9 @@ WEB_UI_HTML = """<!doctype html>
       state.selectedPeerId = peer.peerId;
       el("chat-title").textContent = `${peer.displayName || peer.peerId} · 交流界面`;
       el("chat-subtitle").textContent = peer.endpoint || "";
+      el("status-copy").textContent = connectionSummary(peer);
       el("chat-meta").innerHTML = `
-        <span class="chip">${peer.status || "unknown"}</span>
+        <span class="chip ${peerStatusClass(peer)}">${peerStatusLabel(peer)}</span>
         <span class="chip">${peer.relationshipLevel || "L0"} ${peer.levelName || ""}</span>
       `;
       renderMessages(peer.history || []);
@@ -544,11 +725,23 @@ WEB_UI_HTML = """<!doctype html>
       box.innerHTML = "";
       if (peer.status !== "active") {
         const pairBtn = document.createElement("button");
-        pairBtn.textContent = "立即配对";
+        pairBtn.textContent = state.pairingPeerId === peer.peerId ? "正在发起连接…" : "立即配对";
+        pairBtn.disabled = state.pairingPeerId === peer.peerId;
         pairBtn.addEventListener("click", () => pair(peer.peerId));
         box.appendChild(pairBtn);
+        const hint = document.createElement("button");
+        hint.className = "ghost";
+        hint.textContent = "单向配对：只需你点一次";
+        hint.disabled = true;
+        box.appendChild(hint);
         return;
       }
+
+      const openBtn = document.createElement("button");
+      openBtn.className = "ghost";
+      openBtn.textContent = "已连接，可直接聊天";
+      openBtn.disabled = true;
+      box.appendChild(openBtn);
 
       const levels = ["L1", "L2", "L3", "L4"];
       const currentOrder = ["L0", "L1", "L2", "L3", "L4"];
@@ -591,7 +784,7 @@ WEB_UI_HTML = """<!doctype html>
     async function loadState() {
       const data = await request("/clawsoc/api/state");
       window.__peerList = data.peers || [];
-      renderIdentity(data.identity || {});
+      renderIdentity(data.identity || {}, data.uiUrls || []);
       renderPeerList(window.__peerList);
       if (state.selectedPeerId) {
         const matched = window.__peerList.find((item) => item.peerId === state.selectedPeerId);
@@ -610,7 +803,20 @@ WEB_UI_HTML = """<!doctype html>
       source.addEventListener("ready", () => {
         setNotice("chat-notice", "已切换到实时推送。");
       });
-      source.addEventListener("update", async () => {
+      source.addEventListener("update", async (event) => {
+        let payload = null;
+        try {
+          payload = JSON.parse(event.data);
+        } catch (error) {
+          payload = null;
+        }
+        const notice = describeEvent(payload);
+        if (notice) {
+          setNotice("chat-notice", notice, "success");
+          if (payload?.kind === "pair.completed" || payload?.kind === "pair.accepted") {
+            setNotice("discover-notice", notice, "success");
+          }
+        }
         await loadState().catch(() => {});
         if (state.selectedPeerId) {
           await loadPeer(state.selectedPeerId).catch(() => {});
@@ -643,34 +849,50 @@ WEB_UI_HTML = """<!doctype html>
         });
         window.__peerList = data.peers || [];
         renderPeerList(window.__peerList);
-        setNotice("discover-notice", `发现完成，共 ${data.count || 0} 位龙虾。`);
+        setNotice("discover-notice", `发现完成，共 ${data.count || 0} 位龙虾。点击一次“立即配对”即可发起连接。`);
       } catch (error) {
-        setNotice("discover-notice", error.message, true);
+        setNotice("discover-notice", error.message, "error");
       }
     }
 
     async function pair(peerId) {
       try {
+        state.pairingPeerId = peerId;
+        renderPeerList(window.__peerList || []);
+        if (state.selectedPeerId === peerId && state.selectedPeer) {
+          renderPeerDetail({ ...state.selectedPeer, status: state.selectedPeer.status });
+        }
+        setNotice("discover-notice", "正在向对方发起连接。对方不需要再点配对。");
         const data = await request("/clawsoc/api/pair", {
           method: "POST",
           body: JSON.stringify({ peerId }),
         });
+        state.pairingPeerId = null;
         await loadState();
         await loadPeer(data.peer.peerId, true);
-        setNotice("discover-notice", `已配对 ${data.peer.displayName || data.peer.peerId}`);
+        setNotice(
+          "discover-notice",
+          `已连接 ${data.peer.displayName || data.peer.peerId}。现在双方都可以直接聊天。`,
+          "success",
+        );
       } catch (error) {
-        setNotice("discover-notice", error.message, true);
+        state.pairingPeerId = null;
+        renderPeerList(window.__peerList || []);
+        if (state.selectedPeerId) {
+          await loadPeer(state.selectedPeerId).catch(() => {});
+        }
+        setNotice("discover-notice", error.message, "error");
       }
     }
 
     async function sendMessage() {
       if (!state.selectedPeerId) {
-        setNotice("chat-notice", "请先在左侧选中一位龙虾。", true);
+        setNotice("chat-notice", "请先在左侧选中一位龙虾。", "error");
         return;
       }
       const message = el("message-input").value.trim();
       if (!message) {
-        setNotice("chat-notice", "先输入一句话再发送。", true);
+        setNotice("chat-notice", "先输入一句话再发送。", "error");
         return;
       }
       try {
@@ -681,15 +903,15 @@ WEB_UI_HTML = """<!doctype html>
         el("message-input").value = "";
         await loadPeer(state.selectedPeerId);
         await loadState();
-        setNotice("chat-notice", "消息已发送。");
+        setNotice("chat-notice", "消息已发送。", "success");
       } catch (error) {
-        setNotice("chat-notice", error.message, true);
+        setNotice("chat-notice", error.message, "error");
       }
     }
 
     async function sendShare(shareType) {
       if (!state.selectedPeerId) {
-        setNotice("chat-notice", "请先选中一位龙虾，再发快捷分享。", true);
+        setNotice("chat-notice", "请先选中一位龙虾，再发快捷分享。", "error");
         return;
       }
       try {
@@ -699,15 +921,15 @@ WEB_UI_HTML = """<!doctype html>
         });
         await loadPeer(state.selectedPeerId);
         await loadState();
-        setNotice("chat-notice", `已分享 ${shareType}`);
+        setNotice("chat-notice", `已分享 ${shareType}`, "success");
       } catch (error) {
-        setNotice("chat-notice", error.message, true);
+        setNotice("chat-notice", error.message, "error");
       }
     }
 
     async function requestUpgrade(level) {
       if (!state.selectedPeerId) {
-        setNotice("chat-notice", "请先选中一位龙虾。", true);
+        setNotice("chat-notice", "请先选中一位龙虾。", "error");
         return;
       }
       try {
@@ -717,15 +939,15 @@ WEB_UI_HTML = """<!doctype html>
         });
         await loadPeer(state.selectedPeerId);
         await loadState();
-        setNotice("chat-notice", `已发起升级请求：${level}`);
+        setNotice("chat-notice", `已发起升级请求：${level}`, "success");
       } catch (error) {
-        setNotice("chat-notice", error.message, true);
+        setNotice("chat-notice", error.message, "error");
       }
     }
 
     async function acceptUpgrade() {
       if (!state.selectedPeerId) {
-        setNotice("chat-notice", "请先选中一位龙虾。", true);
+        setNotice("chat-notice", "请先选中一位龙虾。", "error");
         return;
       }
       try {
@@ -735,9 +957,9 @@ WEB_UI_HTML = """<!doctype html>
         });
         await loadPeer(state.selectedPeerId);
         await loadState();
-        setNotice("chat-notice", "已接受升级请求。");
+        setNotice("chat-notice", "已接受升级请求。", "success");
       } catch (error) {
-        setNotice("chat-notice", error.message, true);
+        setNotice("chat-notice", error.message, "error");
       }
     }
 
@@ -751,8 +973,8 @@ WEB_UI_HTML = """<!doctype html>
     });
 
     loadState().catch((error) => {
-      setNotice("discover-notice", error.message, true);
-      setNotice("chat-notice", error.message, true);
+      setNotice("discover-notice", error.message, "error");
+      setNotice("chat-notice", error.message, "error");
     });
     connectRealtime();
     setInterval(() => {
@@ -1020,7 +1242,16 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                 "lastSeenAt": utc_now(),
             },
         )
-        log_event(self.app["paths"], "pair.completed", {"peerId": merged["peerId"], "endpoint": endpoint, "requestId": envelope["requestId"]})
+        log_event(
+            self.app["paths"],
+            "pair.completed",
+            {
+                "peerId": merged["peerId"],
+                "displayName": merged.get("displayName"),
+                "endpoint": endpoint,
+                "requestId": envelope["requestId"],
+            },
+        )
         save_state(self.app["paths"], state)
         return merged
 
@@ -1071,6 +1302,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                 {
                     "ok": True,
                     "identity": state.get("identity", {}),
+                    "uiUrls": ui_urls_from_state(state),
                     "peers": [self._normalize_peer(peer) for peer in peers],
                 },
             )
@@ -1155,6 +1387,16 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         )
         state["audit"]["lastSeenAt"] = utc_now()
         log_event(self.app["paths"], "pair.accepted", {"peerId": peer_id, "requestId": data["requestId"]})
+        log_event(
+            self.app["paths"],
+            "pair.connected",
+            {
+                "peerId": peer_id,
+                "displayName": peer.get("displayName"),
+                "endpoint": peer.get("endpoint"),
+                "requestId": data["requestId"],
+            },
+        )
         save_state(self.app["paths"], state)
         self._send(
             200,
@@ -1214,6 +1456,10 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         if not peer:
             raise SystemExit(f"Unknown peer: {peer_id}")
         target_level = normalize_level(data["payload"]["targetLevel"])
+        if not level_strictly_higher(target_level, peer.get("relationshipLevel", "L0")):
+            raise SystemExit(
+                f"Relationship upgrade must be higher than current level {peer.get('relationshipLevel', 'L0')}, got {target_level}"
+            )
         request = {
             "requestId": data["requestId"],
             "fromPeerId": peer_id,
@@ -1359,10 +1605,20 @@ class ClawSocHandler(BaseHTTPRequestHandler):
     def _handle_ui_relationship_upgrade(self, data: dict) -> None:
         state = self._load_state()
         peer_id = str(data.get("peerId", "")).strip()
-        target_level = normalize_level(str(data.get("level", "")).strip() or "L1")
         peer = state.get("peers", {}).get(peer_id)
         if not peer or peer.get("status") != "active":
             raise SystemExit(f"Peer {peer_id} not paired")
+        current_level = peer.get("relationshipLevel", "L0")
+        requested_level = str(data.get("level", "")).strip()
+        if requested_level:
+            target_level = normalize_level(requested_level)
+        else:
+            current_index = RELATIONSHIP_LEVELS.index(current_level)
+            target_level = RELATIONSHIP_LEVELS[min(current_index + 1, len(RELATIONSHIP_LEVELS) - 1)]
+        if not level_strictly_higher(target_level, current_level):
+            raise SystemExit(
+                f"Relationship upgrade must be higher than current level {current_level}, got {target_level}"
+            )
         envelope = {
             "fromPeerId": state["identity"]["id"],
             "timestamp": utc_now(),
