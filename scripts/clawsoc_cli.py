@@ -30,6 +30,9 @@ from sharing import allowed_share_types, build_share_content, sanitize_share_con
 from soc_store import (
     LEVEL_NAMES,
     SHARE_MIN_LEVEL,
+    choose_preferred_endpoint,
+    derive_observed_endpoint,
+    endpoint_diagnostics_from_state,
     get_paths,
     init_state,
     level_strictly_higher,
@@ -39,9 +42,11 @@ from soc_store import (
     log_message,
     log_share,
     normalize_level,
+    peer_endpoint_candidates,
     save_state,
     upsert_peer,
     ui_urls_from_state,
+    with_observed_endpoint,
     utc_now,
 )
 
@@ -164,6 +169,7 @@ def _render_serve_panel(state: dict) -> str:
     endpoint = identity.get("endpoint", "-")
     health_url = f"{endpoint}/clawsoc/health" if endpoint and endpoint != "-" else "-"
     ui_urls = ui_urls_from_state(state)
+    diagnostics = endpoint_diagnostics_from_state(state)
     lines = [
         "",
         "ClawSoc 服务已启动",
@@ -186,6 +192,8 @@ def _render_serve_panel(state: dict) -> str:
     ]
     if len(ui_urls) > 1:
         lines.insert(8, f"备用 Web UI: {', '.join(ui_urls[1:])}")
+    if diagnostics.get("warning"):
+        lines.insert(9 if len(ui_urls) > 1 else 8, f"地址提示: {diagnostics['warning']}")
     return "\n".join(lines)
 
 
@@ -242,12 +250,17 @@ def _discover_peers(paths, state: dict, args: argparse.Namespace) -> dict[str, d
         if payload.get("peerId") == self_id:
             return None
         endpoint = payload.get("endpoint") or f"http://{host}:{port}"
+        observed_endpoint = f"http://{host}:{port}"
         return {
             "peerId": payload.get("peerId"),
             "displayName": payload.get("displayName") or payload.get("peerId"),
             "emoji": payload.get("emoji") or "🐾",
             "bio": payload.get("bio") or "",
-            "endpoint": endpoint,
+            "endpoint": choose_preferred_endpoint(endpoint, observed_endpoint) or endpoint,
+            "advertisedEndpoint": endpoint,
+            "observedEndpoint": observed_endpoint,
+            "lastObservedEndpoint": observed_endpoint,
+            "observedEndpoints": [observed_endpoint],
             "host": host,
             "port": port,
         }
@@ -291,6 +304,10 @@ def cmd_discover(args: argparse.Namespace) -> None:
                     "emoji": peer["emoji"],
                     "bio": peer["bio"],
                     "endpoint": peer["endpoint"],
+                    "advertisedEndpoint": peer.get("advertisedEndpoint"),
+                    "observedEndpoint": peer.get("observedEndpoint"),
+                    "lastObservedEndpoint": peer.get("lastObservedEndpoint"),
+                    "observedEndpoints": peer.get("observedEndpoints", []),
                     "relationshipLevel": state.get("peers", {}).get(peer["peerId"], {}).get("relationshipLevel", "L0"),
                     "status": state.get("peers", {}).get(peer["peerId"], {}).get("status", "discovered"),
                     "lastSeenAt": utc_now(),
@@ -320,13 +337,35 @@ def _resolve_endpoint(state: dict, target: str) -> str:
         return target.rstrip("/")
     # Known peer_id
     peer = state.get("peers", {}).get(target)
-    if peer and peer.get("endpoint"):
-        return peer["endpoint"].rstrip("/")
+    if peer:
+        candidates = peer_endpoint_candidates(peer)
+        if candidates:
+            return candidates[0].rstrip("/")
     # host:port
     if ":" in target:
         return f"http://{target}"
     # Bare IP or hostname
     return f"http://{target}:45678"
+
+
+def _choose_reachable_peer_endpoint(paths, state: dict, peer: dict, *, reason: str) -> str:
+    candidates = peer_endpoint_candidates(peer)
+    if not candidates:
+        raise SystemExit(f"Peer {peer['peerId']} has no known endpoint")
+    last_error = None
+    for candidate in candidates:
+        payload = probe_health(f"{candidate.rstrip('/')}/clawsoc/health", timeout=0.8)
+        if not payload or not payload.get("ok"):
+            last_error = candidate
+            continue
+        if peer.get("endpoint") != candidate or peer.get("lastWorkingEndpoint") != candidate:
+            peer["endpoint"] = candidate
+            peer["lastWorkingEndpoint"] = candidate
+            peer["lastSeenAt"] = utc_now()
+            log_event(paths, "peer.endpoint.selected", {"peerId": peer["peerId"], "endpoint": candidate, "reason": reason})
+            save_state(paths, state)
+        return candidate.rstrip("/")
+    raise SystemExit(f"Peer {peer['peerId']} has no reachable endpoint. Tried: {', '.join(candidates)}; last failed: {last_error}")
 
 
 def _do_pair(paths, state: dict, endpoint: str) -> dict:
@@ -353,6 +392,8 @@ def _do_pair(paths, state: dict, endpoint: str) -> dict:
     response = request_json(f"{endpoint}/clawsoc/pair", envelope)
     remote_identity = response.get("identity", {})
     existing = state.get("peers", {}).get(remote_id, {})
+    observed_endpoint = endpoint.rstrip("/")
+    preferred_endpoint = choose_preferred_endpoint(remote_identity.get("endpoint"), observed_endpoint) or observed_endpoint
     peer = upsert_peer(
         paths,
         state,
@@ -362,12 +403,28 @@ def _do_pair(paths, state: dict, endpoint: str) -> dict:
             "nickname": remote_identity.get("displayName") or health.get("displayName") or remote_id,
             "emoji": remote_identity.get("emoji") or health.get("emoji"),
             "bio": remote_identity.get("bio") or health.get("bio"),
-            "endpoint": remote_identity.get("endpoint") or endpoint,
+            "endpoint": preferred_endpoint,
+            "advertisedEndpoint": remote_identity.get("endpoint"),
+            "observedEndpoint": observed_endpoint,
+            "lastObservedEndpoint": observed_endpoint,
+            "observedEndpoints": [observed_endpoint],
+            "lastWorkingEndpoint": observed_endpoint,
             "relationshipLevel": existing.get("relationshipLevel", "L0"),
             "status": "active",
             "lastSeenAt": utc_now(),
         },
     )
+    if remote_identity.get("endpoint") and preferred_endpoint != remote_identity.get("endpoint").rstrip("/"):
+        log_event(
+            paths,
+            "peer.endpoint.replaced",
+            {
+                "peerId": peer["peerId"],
+                "advertisedEndpoint": remote_identity.get("endpoint"),
+                "selectedEndpoint": preferred_endpoint,
+                "reason": "pair-response-observed-endpoint-preferred",
+            },
+        )
     log_event(paths, "pair.completed", {"peerId": peer["peerId"], "endpoint": endpoint, "requestId": envelope["requestId"]})
     save_state(paths, state)
     return peer
@@ -594,6 +651,10 @@ def cmd_discover_ui(args: argparse.Namespace) -> None:
                         "emoji": peer["emoji"],
                         "bio": peer["bio"],
                         "endpoint": peer["endpoint"],
+                        "advertisedEndpoint": peer.get("advertisedEndpoint"),
+                        "observedEndpoint": peer.get("observedEndpoint"),
+                        "lastObservedEndpoint": peer.get("lastObservedEndpoint"),
+                        "observedEndpoints": peer.get("observedEndpoints", []),
                         "relationshipLevel": state.get("peers", {}).get(peer["peerId"], {}).get("relationshipLevel", "L0"),
                         "status": state.get("peers", {}).get(peer["peerId"], {}).get("status", "discovered"),
                         "lastSeenAt": utc_now(),
@@ -705,8 +766,9 @@ def _send_chat_message(args: argparse.Namespace) -> dict:
     if not state.get("identity"):
         state = init_state(paths)
     peer = _get_active_peer(state, args.peer_id)
+    peer_endpoint = _choose_reachable_peer_endpoint(paths, state, peer, reason="chat")
     envelope = make_envelope(state["identity"]["id"], "chat.message", {"message": args.message})
-    request_json(f"{peer['endpoint']}/clawsoc/message", envelope)
+    request_json(f"{peer_endpoint}/clawsoc/message", envelope)
     peer["lastMessageAt"] = utc_now()
     peer["lastSeenAt"] = utc_now()
     log_message(paths, peer["peerId"], "outbound", args.message, envelope["requestId"], {"type": "chat"})
@@ -737,6 +799,7 @@ def cmd_share(args: argparse.Namespace) -> None:
     if not state.get("identity"):
         state = init_state(paths)
     peer = _get_active_peer(state, args.peer_id)
+    peer_endpoint = _choose_reachable_peer_endpoint(paths, state, peer, reason="share")
     share_type = SHARE_TYPE_ALIASES.get(args.share_type, args.share_type)
     if share_type not in SHARE_MIN_LEVEL:
         raise SystemExit(f"Unknown share type: {share_type}. Available: {', '.join(sorted(SHARE_MIN_LEVEL))}")
@@ -757,7 +820,7 @@ def cmd_share(args: argparse.Namespace) -> None:
     envelope["relationshipLevel"] = peer["relationshipLevel"]
     envelope["redacted"] = True
     envelope["content"] = content
-    request_json(f"{peer['endpoint']}/clawsoc/share", envelope)
+    request_json(f"{peer_endpoint}/clawsoc/share", envelope)
     peer["lastSharedAt"] = utc_now()
     peer["lastSeenAt"] = utc_now()
     log_share(paths, peer["peerId"], share_type, envelope, envelope["requestId"])
@@ -818,8 +881,9 @@ def cmd_relationship(args: argparse.Namespace) -> None:
             raise SystemExit(
                 f"Relationship upgrade must be higher than current level {peer['relationshipLevel']}, got {target_level}"
             )
+        peer_endpoint = _choose_reachable_peer_endpoint(paths, state, peer, reason="relationship-upgrade")
         envelope = make_envelope(state["identity"]["id"], "relationship.upgrade", {"targetLevel": target_level})
-        response = request_json(f"{peer['endpoint']}/clawsoc/relationship/upgrade", envelope)
+        response = request_json(f"{peer_endpoint}/clawsoc/relationship/upgrade", envelope)
         outbound = {
             "requestId": envelope["requestId"],
             "fromPeerId": state["identity"]["id"],
@@ -852,7 +916,8 @@ def cmd_relationship(args: argparse.Namespace) -> None:
             "relationship.accept",
             {"requestId": request["requestId"], "targetLevel": target_level},
         )
-        request_json(f"{peer['endpoint']}/clawsoc/relationship/accept", envelope)
+        peer_endpoint = _choose_reachable_peer_endpoint(paths, state, peer, reason="relationship-accept")
+        request_json(f"{peer_endpoint}/clawsoc/relationship/accept", envelope)
         state["pending"]["upgradeRequests"] = [
             item for item in state["pending"]["upgradeRequests"] if item["requestId"] != request["requestId"]
         ]

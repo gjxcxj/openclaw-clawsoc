@@ -14,6 +14,9 @@ from urllib.parse import parse_qs, urlparse
 from soc_store import (
     LEVEL_NAMES,
     RELATIONSHIP_LEVELS,
+    choose_preferred_endpoint,
+    derive_observed_endpoint,
+    endpoint_diagnostics_from_state,
     level_at_least,
     level_strictly_higher,
     load_state,
@@ -21,8 +24,10 @@ from soc_store import (
     log_message,
     log_share,
     normalize_level,
+    peer_endpoint_candidates,
     save_state,
     ui_urls_from_state,
+    with_observed_endpoint,
     upsert_peer,
     utc_now,
 )
@@ -619,7 +624,8 @@ WEB_UI_HTML = """<!doctype html>
 
     function renderIdentity(identity, uiUrls = []) {
       el("identity-name").textContent = `${identity.emoji || "🐾"} ${identity.displayName || "-"}`;
-      el("identity-bio").textContent = identity.bio || "一个正在学习社交协作的 Claw";
+      const warning = window.__endpointDiagnostics?.warning;
+      el("identity-bio").textContent = warning ? `${identity.bio || "一个正在学习社交协作的 Claw"} · ${warning}` : (identity.bio || "一个正在学习社交协作的 Claw");
       el("identity-id").textContent = identity.id || "-";
       el("identity-endpoint").textContent = identity.endpoint || "-";
       const uiUrl = uiUrls[0] || `http://127.0.0.1:${identity.port || 45678}/clawsoc/ui`;
@@ -783,6 +789,7 @@ WEB_UI_HTML = """<!doctype html>
 
     async function loadState() {
       const data = await request("/clawsoc/api/state");
+      window.__endpointDiagnostics = data.endpointDiagnostics || null;
       window.__peerList = data.peers || [];
       renderIdentity(data.identity || {}, data.uiUrls || []);
       renderPeerList(window.__peerList);
@@ -1044,6 +1051,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         return load_state(self.app["paths"])
 
     def _health_payload(self, state: dict) -> dict:
+        diagnostics = endpoint_diagnostics_from_state(state)
         return {
             "ok": True,
             "peerId": state.get("identity", {}).get("id"),
@@ -1052,6 +1060,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             "bio": state.get("identity", {}).get("bio"),
             "endpoint": state.get("identity", {}).get("endpoint"),
             "port": state.get("settings", {}).get("port"),
+            "endpointDiagnostics": diagnostics,
         }
 
     def _normalize_peer(self, peer: dict) -> dict:
@@ -1059,6 +1068,34 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             **peer,
             "levelName": LEVEL_NAMES.get(peer.get("relationshipLevel", "L0"), peer.get("relationshipLevel", "L0")),
         }
+
+    def _peer_endpoint(self, state: dict, peer_id: str, reason: str) -> str:
+        peer = state.get("peers", {}).get(peer_id)
+        if not peer:
+            raise SystemExit(f"Unknown peer: {peer_id}")
+        candidates = peer_endpoint_candidates(peer)
+        if not candidates:
+            raise SystemExit(f"Peer {peer_id} has no known endpoint")
+        last_error = None
+        for candidate in candidates:
+            request = urllib.request.Request(f"{candidate.rstrip('/')}/clawsoc/health", method="GET")
+            try:
+                with urllib.request.urlopen(request, timeout=0.8) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+                last_error = candidate
+                continue
+            if not payload.get("ok"):
+                last_error = candidate
+                continue
+            if peer.get("endpoint") != candidate or peer.get("lastWorkingEndpoint") != candidate:
+                peer["endpoint"] = candidate
+                peer["lastWorkingEndpoint"] = candidate
+                peer["lastSeenAt"] = utc_now()
+                log_event(self.app["paths"], "peer.endpoint.selected", {"peerId": peer_id, "endpoint": candidate, "reason": reason})
+                save_state(self.app["paths"], state)
+            return candidate.rstrip("/")
+        raise SystemExit(f"Peer {peer_id} has no reachable endpoint. Tried: {', '.join(candidates)}; last failed: {last_error}")
 
     def _pending_upgrade_for_peer(self, state: dict, peer_id: str) -> tuple[dict | None, dict | None]:
         inbound = None
@@ -1161,13 +1198,19 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                 return None
             endpoint = payload.get("endpoint") or f"http://{host}:{port}"
             existing = state.get("peers", {}).get(peer_id, {})
+            observed_endpoint = f"http://{host}:{port}"
+            merged_peer = with_observed_endpoint(existing, observed_endpoint, endpoint)
             return {
                 "peerId": peer_id,
                 "displayName": payload.get("displayName") or peer_id,
                 "nickname": payload.get("displayName") or peer_id,
                 "emoji": payload.get("emoji") or "🐾",
                 "bio": payload.get("bio") or "",
-                "endpoint": endpoint,
+                "endpoint": choose_preferred_endpoint(endpoint, observed_endpoint) or endpoint,
+                "advertisedEndpoint": endpoint,
+                "observedEndpoint": observed_endpoint,
+                "lastObservedEndpoint": observed_endpoint,
+                "observedEndpoints": merged_peer.get("observedEndpoints", [observed_endpoint]),
                 "relationshipLevel": existing.get("relationshipLevel", "L0"),
                 "status": existing.get("status", "discovered"),
                 "lastSeenAt": utc_now(),
@@ -1227,6 +1270,8 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             raise SystemExit(exc.read().decode("utf-8", errors="ignore") or exc.reason) from exc
         identity = payload.get("identity", {})
         existing = state.get("peers", {}).get(remote_id, {})
+        observed_endpoint = endpoint.rstrip("/")
+        preferred_endpoint = choose_preferred_endpoint(identity.get("endpoint"), observed_endpoint) or observed_endpoint
         merged = upsert_peer(
             self.app["paths"],
             state,
@@ -1236,12 +1281,28 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                 "nickname": identity.get("displayName") or health.get("displayName") or remote_id,
                 "emoji": identity.get("emoji") or health.get("emoji"),
                 "bio": identity.get("bio") or health.get("bio"),
-                "endpoint": identity.get("endpoint") or endpoint.rstrip("/"),
+                "endpoint": preferred_endpoint,
+                "advertisedEndpoint": identity.get("endpoint"),
+                "observedEndpoint": observed_endpoint,
+                "lastObservedEndpoint": observed_endpoint,
+                "observedEndpoints": [observed_endpoint],
+                "lastWorkingEndpoint": observed_endpoint,
                 "relationshipLevel": existing.get("relationshipLevel", "L0"),
                 "status": "active",
                 "lastSeenAt": utc_now(),
             },
         )
+        if identity.get("endpoint") and preferred_endpoint != identity.get("endpoint").rstrip("/"):
+            log_event(
+                self.app["paths"],
+                "peer.endpoint.replaced",
+                {
+                    "peerId": merged["peerId"],
+                    "advertisedEndpoint": identity.get("endpoint"),
+                    "selectedEndpoint": preferred_endpoint,
+                    "reason": "pair-response-observed-endpoint-preferred",
+                },
+            )
         log_event(
             self.app["paths"],
             "pair.completed",
@@ -1259,6 +1320,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state.get("peers", {}).get(peer_id)
         if not peer or peer.get("status") != "active":
             raise SystemExit(f"Peer {peer_id} not paired")
+        peer_endpoint = self._peer_endpoint(state, peer_id, "chat")
         envelope = {
             "fromPeerId": state["identity"]["id"],
             "timestamp": utc_now(),
@@ -1268,7 +1330,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         }
         data = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
-            f"{peer['endpoint'].rstrip('/')}/clawsoc/message",
+            f"{peer_endpoint}/clawsoc/message",
             data=data,
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1303,6 +1365,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "identity": state.get("identity", {}),
                     "uiUrls": ui_urls_from_state(state),
+                    "endpointDiagnostics": endpoint_diagnostics_from_state(state),
                     "peers": [self._normalize_peer(peer) for peer in peers],
                 },
             )
@@ -1321,6 +1384,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             normalized["history"] = self._load_peer_history(peer_id)
             normalized["recentShares"] = self._recent_share_summaries(peer_id)
             normalized["quickShares"] = self._quick_shares(peer.get("relationshipLevel", "L0"))
+            normalized["endpointSuspicious"] = endpoint_diagnostics_from_state({"identity": {"endpoint": peer.get("advertisedEndpoint") or peer.get("endpoint")}})["suspicious"]
             inbound, outbound = self._pending_upgrade_for_peer(state, peer_id)
             normalized["pendingInboundUpgrade"] = inbound
             normalized["pendingOutboundUpgrade"] = outbound
@@ -1370,6 +1434,8 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         state = load_state(self.app["paths"])
         peer_id = data["fromPeerId"]
         existing = state["peers"].get(peer_id, {})
+        observed_endpoint = derive_observed_endpoint(self.client_address[0], data["payload"].get("endpoint"))
+        preferred_endpoint = choose_preferred_endpoint(data["payload"].get("endpoint"), observed_endpoint) or observed_endpoint
         peer = upsert_peer(
             self.app["paths"],
             state,
@@ -1379,13 +1445,29 @@ class ClawSocHandler(BaseHTTPRequestHandler):
                 "nickname": data["payload"]["displayName"],
                 "emoji": data["payload"].get("emoji"),
                 "bio": data["payload"].get("bio"),
-                "endpoint": data["payload"]["endpoint"],
+                "endpoint": preferred_endpoint,
+                "advertisedEndpoint": data["payload"].get("endpoint"),
+                "observedEndpoint": observed_endpoint,
+                "lastObservedEndpoint": observed_endpoint,
+                "observedEndpoints": [observed_endpoint],
+                "lastWorkingEndpoint": observed_endpoint,
                 "relationshipLevel": existing.get("relationshipLevel", "L0"),
                 "status": "active",
                 "lastSeenAt": utc_now(),
             },
         )
         state["audit"]["lastSeenAt"] = utc_now()
+        if data["payload"].get("endpoint") and preferred_endpoint != data["payload"]["endpoint"].rstrip("/"):
+            log_event(
+                self.app["paths"],
+                "peer.endpoint.replaced",
+                {
+                    "peerId": peer_id,
+                    "advertisedEndpoint": data["payload"].get("endpoint"),
+                    "selectedEndpoint": preferred_endpoint,
+                    "reason": "pair-request-observed-endpoint-preferred",
+                },
+            )
         log_event(self.app["paths"], "pair.accepted", {"peerId": peer_id, "requestId": data["requestId"]})
         log_event(
             self.app["paths"],
@@ -1419,6 +1501,10 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state["peers"].get(peer_id)
         if not peer:
             raise SystemExit(f"Unknown peer: {peer_id}")
+        observed_endpoint = derive_observed_endpoint(self.client_address[0], peer.get("advertisedEndpoint") or peer.get("endpoint"))
+        if observed_endpoint != peer.get("lastObservedEndpoint"):
+            peer.update(with_observed_endpoint(peer, observed_endpoint, peer.get("advertisedEndpoint")))
+            log_event(self.app["paths"], "peer.endpoint.observed", {"peerId": peer_id, "endpoint": observed_endpoint, "reason": "message-inbound"})
         message = data["payload"]["message"]
         peer["lastSeenAt"] = utc_now()
         peer["lastMessageAt"] = utc_now()
@@ -1434,6 +1520,10 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state["peers"].get(peer_id)
         if not peer:
             raise SystemExit(f"Unknown peer: {peer_id}")
+        observed_endpoint = derive_observed_endpoint(self.client_address[0], peer.get("advertisedEndpoint") or peer.get("endpoint"))
+        if observed_endpoint != peer.get("lastObservedEndpoint"):
+            peer.update(with_observed_endpoint(peer, observed_endpoint, peer.get("advertisedEndpoint")))
+            log_event(self.app["paths"], "peer.endpoint.observed", {"peerId": peer_id, "endpoint": observed_endpoint, "reason": "share-inbound"})
         share_type = data["shareType"]
         if share_type not in self.app["share_requirements"]:
             raise SystemExit(f"Unknown share type: {share_type}")
@@ -1455,6 +1545,10 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state["peers"].get(peer_id)
         if not peer:
             raise SystemExit(f"Unknown peer: {peer_id}")
+        observed_endpoint = derive_observed_endpoint(self.client_address[0], peer.get("advertisedEndpoint") or peer.get("endpoint"))
+        if observed_endpoint != peer.get("lastObservedEndpoint"):
+            peer.update(with_observed_endpoint(peer, observed_endpoint, peer.get("advertisedEndpoint")))
+            log_event(self.app["paths"], "peer.endpoint.observed", {"peerId": peer_id, "endpoint": observed_endpoint, "reason": "relationship-upgrade-inbound"})
         target_level = normalize_level(data["payload"]["targetLevel"])
         if not level_strictly_higher(target_level, peer.get("relationshipLevel", "L0")):
             raise SystemExit(
@@ -1483,6 +1577,10 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state["peers"].get(peer_id)
         if not peer:
             raise SystemExit(f"Unknown peer: {peer_id}")
+        observed_endpoint = derive_observed_endpoint(self.client_address[0], peer.get("advertisedEndpoint") or peer.get("endpoint"))
+        if observed_endpoint != peer.get("lastObservedEndpoint"):
+            peer.update(with_observed_endpoint(peer, observed_endpoint, peer.get("advertisedEndpoint")))
+            log_event(self.app["paths"], "peer.endpoint.observed", {"peerId": peer_id, "endpoint": observed_endpoint, "reason": "relationship-accept-inbound"})
         target_level = normalize_level(data["payload"]["targetLevel"])
         peer["relationshipLevel"] = target_level
         peer["updatedAt"] = utc_now()
@@ -1561,6 +1659,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state.get("peers", {}).get(peer_id)
         if not peer or peer.get("status") != "active":
             raise SystemExit(f"Peer {peer_id} not paired")
+        peer_endpoint = self._peer_endpoint(state, peer_id, "share")
         minimum = self.app["share_requirements"].get(share_type)
         if not minimum:
             raise SystemExit(f"Unknown share type: {share_type}")
@@ -1585,7 +1684,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             "content": content,
         }
         request = urllib.request.Request(
-            f"{peer['endpoint'].rstrip('/')}/clawsoc/share",
+            f"{peer_endpoint}/clawsoc/share",
             data=json.dumps(envelope, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1608,6 +1707,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state.get("peers", {}).get(peer_id)
         if not peer or peer.get("status") != "active":
             raise SystemExit(f"Peer {peer_id} not paired")
+        peer_endpoint = self._peer_endpoint(state, peer_id, "relationship-upgrade")
         current_level = peer.get("relationshipLevel", "L0")
         requested_level = str(data.get("level", "")).strip()
         if requested_level:
@@ -1627,7 +1727,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             "payload": {"targetLevel": target_level},
         }
         request = urllib.request.Request(
-            f"{peer['endpoint'].rstrip('/')}/clawsoc/relationship/upgrade",
+            f"{peer_endpoint}/clawsoc/relationship/upgrade",
             data=json.dumps(envelope, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -1658,6 +1758,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
         peer = state.get("peers", {}).get(peer_id)
         if not peer or peer.get("status") != "active":
             raise SystemExit(f"Peer {peer_id} not paired")
+        peer_endpoint = self._peer_endpoint(state, peer_id, "relationship-accept")
         request_item = None
         for item in state.get("pending", {}).get("upgradeRequests", []):
             if item.get("fromPeerId") == peer_id and item.get("status") == "pending-inbound":
@@ -1679,7 +1780,7 @@ class ClawSocHandler(BaseHTTPRequestHandler):
             },
         }
         request = urllib.request.Request(
-            f"{peer['endpoint'].rstrip('/')}/clawsoc/relationship/accept",
+            f"{peer_endpoint}/clawsoc/relationship/accept",
             data=json.dumps(envelope, ensure_ascii=False).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",

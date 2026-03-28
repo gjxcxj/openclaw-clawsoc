@@ -11,6 +11,8 @@ import unittest
 import urllib.request
 from pathlib import Path
 
+from soc_store import choose_preferred_endpoint, endpoint_is_suspicious
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI_PATH = SCRIPT_DIR / "clawsoc_cli.py"
@@ -37,6 +39,11 @@ def wait_for_health(endpoint: str, timeout: float = 8.0) -> dict:
 
 
 class ClawSocSmokeTest(unittest.TestCase):
+    def test_endpoint_selection_prefers_real_lan_over_virtual(self) -> None:
+        self.assertTrue(endpoint_is_suspicious("http://198.18.0.1:45678"))
+        selected = choose_preferred_endpoint("http://198.18.0.1:45678", "http://10.0.0.21:45678")
+        self.assertEqual(selected, "http://10.0.0.21:45678")
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory(prefix="clawsoc-smoke-")
         root = Path(self.tempdir.name)
@@ -77,13 +84,22 @@ class ClawSocSmokeTest(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True, env=env, check=True)
         return result.stdout
 
-    def start_server(self, workspace_root: Path, *, name: str, bio: str, port: int) -> subprocess.Popen:
+    def start_server(
+        self,
+        workspace_root: Path,
+        *,
+        name: str,
+        bio: str,
+        port: int,
+        advertise_host: str = "127.0.0.1",
+        bind_host: str = "127.0.0.1",
+    ) -> subprocess.Popen:
         env = os.environ.copy()
         env.update(
             {
                 "CLAWSOC_NAME": name,
                 "CLAWSOC_BIO": bio,
-                "CLAWSOC_ADVERTISE_HOST": "127.0.0.1",
+                "CLAWSOC_ADVERTISE_HOST": advertise_host,
             }
         )
         command = [
@@ -93,7 +109,7 @@ class ClawSocSmokeTest(unittest.TestCase):
             str(workspace_root),
             "serve",
             "--host",
-            "127.0.0.1",
+            bind_host,
             "--port",
             str(port),
         ]
@@ -168,6 +184,55 @@ class ClawSocSmokeTest(unittest.TestCase):
         share_payload = json.loads(share_files[-1].read_text(encoding="utf-8"))
         self.assertEqual(share_payload["shareType"], "skills")
         self.assertTrue(share_payload["content"]["skills"])
+
+    def test_bad_advertise_endpoint_falls_back_to_observed_endpoint(self) -> None:
+        self.run_cli(
+            self.alpha_root,
+            "init",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.alpha_port),
+            extra_env={"CLAWSOC_NAME": "Alpha", "CLAWSOC_BIO": "alpha claw", "CLAWSOC_ADVERTISE_HOST": "198.18.0.1"},
+        )
+        self.run_cli(
+            self.beta_root,
+            "init",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(self.beta_port),
+            extra_env={"CLAWSOC_NAME": "Beta", "CLAWSOC_BIO": "beta claw", "CLAWSOC_ADVERTISE_HOST": "127.0.0.1"},
+        )
+        self.start_server(
+            self.alpha_root,
+            name="Alpha",
+            bio="alpha claw",
+            port=self.alpha_port,
+            advertise_host="198.18.0.1",
+            bind_host="0.0.0.0",
+        )
+        self.start_server(self.beta_root, name="Beta", bio="beta claw", port=self.beta_port)
+        alpha_health = wait_for_health(self.alpha_endpoint)
+        beta_health = wait_for_health(self.beta_endpoint)
+        alpha_id = alpha_health["peerId"]
+        beta_id = beta_health["peerId"]
+
+        discover_output = self.run_cli(self.beta_root, "discover", "--hosts", "127.0.0.1", "--ports", str(self.alpha_port), "--record")
+        discovered = json.loads(discover_output)
+        self.assertEqual(discovered["count"], 1)
+
+        pair_output = self.run_cli(self.beta_root, "pair", alpha_id)
+        self.assertTrue(json.loads(pair_output)["ok"])
+
+        beta_state = json.loads((self.beta_root / "soc" / "state.json").read_text(encoding="utf-8"))
+        alpha_peer = beta_state["peers"][alpha_id]
+        self.assertEqual(alpha_peer["endpoint"], self.alpha_endpoint)
+        self.assertEqual(alpha_peer["advertisedEndpoint"], "http://198.18.0.1:%s" % self.alpha_port)
+
+        self.run_cli(self.beta_root, "chat", alpha_id, "能收到吗")
+        history_output = self.run_cli(self.alpha_root, "history", beta_id, "--limit", "5")
+        self.assertIn("能收到吗", history_output)
 
 
 if __name__ == "__main__":
